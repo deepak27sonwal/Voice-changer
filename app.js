@@ -267,16 +267,31 @@ const KVOICES = [
   ['af_heart', 'Heart', 'female', 'US'], ['af_bella', 'Bella', 'female', 'US'], ['af_nicole', 'Nicole', 'female', 'US'], ['af_sarah', 'Sarah', 'female', 'US'], ['af_nova', 'Nova', 'female', 'US'],
   ['bf_emma', 'Emma', 'female', 'UK'], ['bf_isabella', 'Isabella', 'female', 'UK'],
 ].map(([id, name, gender, acc]) => ({ id, name, gender, acc }));
-let kokoroP = null;
-function loadKokoro(onProgress) {
-  return kokoroP || (kokoroP = (async () => {
-    const mod = await import((window.JV_CONFIG || {}).KOKORO_URL || KOKORO.url), files = {};
-    return mod.KokoroTTS.from_pretrained(KOKORO.model, { dtype: 'q8', device: 'wasm', progress_callback: p => {
-      if (p.status !== 'progress' || !p.total) return; files[p.file] = p;
-      const L = Object.values(files); onProgress?.(L.reduce((s, f) => s + f.loaded, 0) / L.reduce((s, f) => s + f.total, 0));
-    } });
-  })().catch(e => { kokoroP = null; throw e; }));
-}
+/** Worker client for the neural engine (tts-worker.js). One shared worker; `reset()` kills it (cancel / retry). */
+const neural = (() => {
+  let c = null;
+  const reset = () => { if (c) { c.w.terminate(); c.pending.forEach(p => p.rej(new Error('cancelled'))); } c = null; };
+  const start = () => {
+    if (c) return c;
+    const w = new Worker('tts-worker.js', { type: 'module' }), me = c = { w, listeners: new Set(), pending: new Map(), ready: null, fail: null };
+    w.onmessage = ({ data: m }) => {
+      if (m.type === 'audio') { me.pending.get(m.id)?.res(m); me.pending.delete(m.id); }
+      else if (m.type === 'error') { const p = me.pending.get(m.id); if (p) { p.rej(new Error(m.message)); me.pending.delete(m.id); } else me.fail(new Error(m.message)); }
+      else me.listeners.forEach(l => l(m));
+    };
+    w.onerror = e => me.fail(new Error(e.message || 'engine failed to start'));
+    me.ready = new Promise((res, rej) => { me.fail = rej; me.listeners.add(m => m.type === 'ready' && res()); });
+    me.ready.catch(() => { if (c === me) reset(); });
+    w.postMessage({ type: 'load', url: (window.JV_CONFIG || {}).KOKORO_URL || KOKORO.url, model: KOKORO.model });
+    return me;
+  };
+  const timeout = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} timed out`)), ms))]);
+  return {
+    reset,
+    load: (onEvent, idleMs = 240000) => { const me = start(); me.listeners.add(onEvent); return timeout(me.ready, idleMs, 'Loading the voice engine').finally(() => me.listeners.delete(onEvent)); },
+    generate: (text, voice, speed) => { const me = start(), id = uid(); return timeout(new Promise((res, rej) => { me.pending.set(id, { res, rej }); me.w.postMessage({ type: 'gen', id, text, voice, speed }); }), 180000, 'Generating speech'); },
+  };
+})();
 const splitText = (text, max = 220) => {
   const out = []; let cur = '';
   for (const s of text.match(/[^.!?।\n]+[.!?।]*/g) || [text]) { if (cur && (cur + s).length > max) { out.push(cur.trim()); cur = ''; } cur += s + ' '; }
@@ -289,11 +304,16 @@ const needsDeviceVoice = (text, sysVoice) => /[\u0900-\u097F]/.test(text) || (sy
  * toward the saved voice (Similarity slider = how far) with the formant-preserving shifter.
  * Resolves to { data, sr } (mono Float32).
  */
-async function neuralSpeech(text, voice, st, onStatus) {
-  const tts = await loadKokoro(f => onStatus('load', f));
+async function neuralSpeech(text, voice, st, onStatus, cancelled = () => false) {
+  await neural.load(m => { if (m.type === 'stage') onStatus(m.text, null); else if (m.type === 'progress') onStatus(`Downloading voice model… ${Math.round(m.f * 100)}%`, m.f); });
   const kid = st.sysVoice?.startsWith('k:') ? st.sysVoice.slice(2) : voice.kv || (isMale(voice) ? 'am_adam' : 'af_heart');
   const chunks = splitText(text), parts = [], speed = clamp(1.15 - .25 * st.stability, .85, 1.2); let sr = 24000;
-  for (let i = 0; i < chunks.length; i++) { onStatus('gen', i / chunks.length); const a = await tts.generate(chunks[i], { voice: kid, speed }); sr = a.sampling_rate; parts.push(a.audio); }
+  for (let i = 0; i < chunks.length; i++) {
+    if (cancelled()) throw new Error('cancelled');
+    onStatus(`Generating speech… ${i + 1}/${chunks.length}`, i / chunks.length);
+    const a = await neural.generate(chunks[i], kid, speed); sr = a.sr; parts.push(a.audio);
+  }
+  onStatus('Matching your voice…', 1); await sleep(30);
   const gap = Math.round(sr * .12), n = parts.reduce((s, p) => s + p.length, 0) + gap * (parts.length - 1), data = new Float32Array(n);
   let o = 0; parts.forEach(p => { data.set(p, o); o += p.length + gap; });
   const base = ac().createBuffer(1, n, sr); base.copyToChannel(data, 0);
@@ -622,17 +642,31 @@ V['tts-result'] = () => {
   const res = S.ttsResult, v = res && findVoice(res.voiceId);
   if (!v) return { html: '', bind: () => go('tts') };
   return { html: `<section class="screen">${top('Generated Audio')}<div id="body"><div class="player center"><div class="muted" id="status">Preparing…</div>
-    <div class="bar"><i id="barfill"></i></div></div></div></section>`,
+    <div class="bar"><i id="barfill"></i></div><div class="muted" id="elapsed" style="margin-top:8px;font-size:12px"></div></div>
+    <p class="muted center" style="margin:14px 0">The first time downloads the voice model (about 90 MB) and may take a minute on slow connections.</p>
+    <button class="btn outline" id="usedev">Use device voice instead</button><div class="gap"></div><button class="btn ghost" id="cancel">Cancel</button></div></section>`,
   bind: async r => {
-    const body = $('#body', r), gone = () => !r.isConnected, status = (t, f) => { if (gone()) return; $('#status', r).textContent = t; $('#barfill', r).style.width = Math.round((f || 0) * 100) + '%'; };
-    let buf = res.buf, blob = res.blob, device = false;
+    const body = $('#body', r), gone = () => !r.isConnected;
+    let cancelled = false, device = false, buf = res.buf, blob = res.blob;
+    const t0 = Date.now(), tick = setInterval(() => { if (gone()) return clearInterval(tick); $('#elapsed', r).textContent = `${Math.round((Date.now() - t0) / 1000)} s`; }, 500);
+    const status = (t, f) => { if (gone()) return; $('#status', r).textContent = t; if (f != null) $('#barfill', r).style.width = Math.round(f * 100) + '%'; };
     if (!buf) {
+      $('#cancel', r).onclick = () => { cancelled = true; neural.reset(); go('tts'); };
+      $('#usedev', r).onclick = () => { device = true; neural.reset(); startDevice(); };
+      let startDevice = () => {};
       if (needsDeviceVoice(res.text, S.tts.sysVoice)) device = true;
-      else try {
-        const out = await neuralSpeech(res.text, v, S.tts, (k, f) => k === 'load' ? status(`Downloading voice engine (first time only)… ${Math.round(f * 100)}%`, f) : status('Generating speech…', f));
-        buf = ac().createBuffer(1, out.data.length, out.sr); buf.copyToChannel(out.data, 0); blob = encodeWav(out.data, out.sr);
-      } catch (e) { console.warn('[neural tts]', e); device = true; toast('Neural voice unavailable – using the device voice'); }
+      else {
+        try {
+          const out = await new Promise((resolve, reject) => {
+            startDevice = () => resolve(null);
+            neuralSpeech(res.text, v, S.tts, status, () => cancelled || device).then(resolve, reject);
+          });
+          if (out) { buf = ac().createBuffer(1, out.data.length, out.sr); buf.copyToChannel(out.data, 0); blob = encodeWav(out.data, out.sr); }
+        } catch (e) { if (cancelled) return; console.warn('[neural tts]', e); device = true; toast(`Neural voice unavailable (${String(e.message || e).slice(0, 60)}) – using the device voice`); }
+        if (!buf) device = true;
+      }
     }
+    clearInterval(tick);
     if (gone()) return;
     const src = device ? speakSource(res.text, v, S.tts.stability, S.tts.similarity, S.tts.sysVoice.startsWith('k:') ? '' : S.tts.sysVoice) : bufferSource(buf);
     body.innerHTML = `<div class="player">${playerHtml(device ? fakePeaks(res.text.length) : peaks(buf), src.duration, true)}</div>

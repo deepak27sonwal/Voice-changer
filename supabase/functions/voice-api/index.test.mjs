@@ -45,7 +45,7 @@ test('clone rejects empty or oversized samples', async () => {
 test('tts streams audio for an owned voice', async () => {
   const r = await handle(post('tts', { voice_id: 'abcdefghij123', text: 'hi', stability: 2, similarity: -1 }), deps());
   assert.equal(r.status, 200); assert.equal(r.headers.get('content-type'), 'audio/mpeg');
-  const sent = JSON.parse(calls.at(-1).init.body); assert.deepEqual(sent.voice_settings, { stability: 1, similarity_boost: 0 });
+  const sent = JSON.parse(calls.at(-1).init.body); assert.deepEqual(sent.voice_settings, { stability: 1, similarity_boost: 0, style: 0, use_speaker_boost: true });
 });
 test('tts refuses voices the caller does not own', async () => assert.equal((await handle(post('tts', { voice_id: 'abcdefghij123', text: 'hi' }), deps(false))).status, 404));
 test('tts validates text and voice id', async () => {
@@ -80,4 +80,13 @@ test('free plan only offers premade voices (library voices return 402 there)', a
     assert.deepEqual(voices.map(v => v.name), ['Roger']);
     assert.equal((await handle(post('tts', { voice_id: 'libraryHindi0001', text: 'hi' }), deps(false))).status, 404);
   } finally { tier = 'starter'; }
+});
+test('tts passes style, speed (clamped to 0.7–1.2) and speaker boost', async () => {
+  await handle(post('tts', { voice_id: 'abcdefghij123', text: 'hi', style: .4, speed: 3, boost: false }), deps());
+  assert.deepEqual(JSON.parse(calls.at(-1).init.body).voice_settings, { stability: .5, similarity_boost: .75, style: .4, use_speaker_boost: false, speed: 1.2 });
+});
+test('sts passes style and speaker boost from the form', async () => {
+  const f = new FormData(); f.set('voice_id', 'abcdefghij123'); f.set('audio', new Blob([new Uint8Array(20)])); f.set('style', '0.3'); f.set('boost', 'false');
+  await handle(post('sts', f), deps());
+  const vs = JSON.parse(calls.at(-1).init.body.get('voice_settings')); assert.equal(vs.style, .3); assert.equal(vs.use_speaker_boost, false);
 });

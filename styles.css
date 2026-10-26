@@ -176,3 +176,9 @@ input[type=range] { width: 100%; accent-color: var(--p); }
 
 .bar { height: 8px; border-radius: 99px; background: var(--line); margin-top: 14px; overflow: hidden; }
 .bar i { display: block; height: 100%; width: 0; background: var(--grad); transition: width .2s; }
+
+/* voice control settings panel */
+.vs { border: 1px solid var(--line); border-radius: 14px; padding: 4px 14px 12px; margin: 14px 0; background: #faf9ff; }
+.vs summary { cursor: pointer; font-weight: 600; font-size: 14px; padding: 10px 0 4px; list-style-position: inside; }
+.vs .slider { grid-template-columns: 80px 1fr 56px; }
+.vs .slider b { text-align: right; font-size: 13px; font-weight: 600; }

@@ -56,7 +56,12 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
     return accountVoices = (b.voices ?? []).filter((v: { category?: string }) => v.category !== 'cloned' && (tier !== 'free' || v.category === 'premade'));
   };
   const usable = async (id: string) => VOICE_ID.test(id) && ((await owns(id)) || (await listAccountVoices()).some(v => v.voice_id === id));
-  const settings = (stability: unknown, similarity: unknown) => ({ stability: clamp01(stability, .5), similarity_boost: clamp01(similarity, .75) });
+  const settings = (b: { stability?: unknown; similarity?: unknown; style?: unknown; speed?: unknown; boost?: unknown }) => {
+    const speed = b.speed === undefined || b.speed === null || b.speed === '' ? NaN : Number(b.speed);
+    return { stability: clamp01(b.stability, .5), similarity_boost: clamp01(b.similarity, .75), style: clamp01(b.style, 0),
+      use_speaker_boost: b.boost === undefined || b.boost === null ? true : String(b.boost) !== 'false',
+      ...(Number.isFinite(speed) ? { speed: Math.min(1.2, Math.max(.7, speed)) } : {}) };
+  };
 
   const path = new URL(req.url).pathname, route = path.split('/').filter(Boolean).pop();
   console.log('[voice-api]', req.method, path);
@@ -88,7 +93,7 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       if (!(await usable(String(b.voice_id)))) return json({ error: `voice not found for this account (${route})` }, 404);
       const r = await f(`${EL}/text-to-speech/${b.voice_id}?output_format=mp3_44100_128`, {
         method: 'POST', headers: { ...xi, 'content-type': 'application/json' },
-        body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: settings(b.stability, b.similarity) }),
+        body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: settings(b) }),
       });
       return r.ok ? new Response(r.body, { headers: { ...cors, 'content-type': 'audio/mpeg' } }) : upstreamError(r);
     }
@@ -101,7 +106,7 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       const up = new FormData();
       up.append('audio', audio, 'input.wav');
       up.set('model_id', 'eleven_multilingual_sts_v2');
-      up.set('voice_settings', JSON.stringify(settings(form.get('stability'), form.get('similarity'))));
+      up.set('voice_settings', JSON.stringify(settings({ stability: form.get('stability'), similarity: form.get('similarity'), style: form.get('style'), boost: form.get('boost') })));
       up.set('remove_background_noise', 'true');
       const r = await f(`${EL}/speech-to-speech/${id}?output_format=mp3_44100_128`, { method: 'POST', headers: xi, body: up });
       return r.ok ? new Response(r.body, { headers: { ...cors, 'content-type': 'audio/mpeg' } }) : upstreamError(r);

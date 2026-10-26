@@ -86,20 +86,20 @@ const blobs = {
 };
 
 const PRESETS = [
-  { id: 'pre-narrator', gender: 'female', name: 'Female Narrator', cat: 'English', pitch: 210, dur: 60, preset: true },
-  { id: 'pre-anchor', gender: 'male', name: 'News Anchor', cat: 'Hindi', pitch: 115, dur: 60, preset: true },
-  { id: 'pre-char', gender: 'female', name: 'Character 1', cat: 'Custom', pitch: 290, dur: 180, preset: true },
-  { id: 'pre-deep', gender: 'male', name: 'Deep Voice', cat: 'English', pitch: 85, dur: 90, preset: true },
-  { id: 'pre-man', gender: 'male', name: 'Young Man', cat: 'Male', pitch: 125, dur: 60, preset: true },
-  { id: 'pre-elder', gender: 'male', name: 'Elderly Man', cat: 'Male', pitch: 100, dur: 60, preset: true },
-  { id: 'pre-woman', gender: 'female', name: 'Soft Woman', cat: 'Female', pitch: 235, dur: 60, preset: true },
-  { id: 'pre-grand', gender: 'female', name: 'Elderly Woman', cat: 'Female', pitch: 195, dur: 60, preset: true },
-  { id: 'pre-child', gender: 'female', name: 'Child', cat: 'Character', pitch: 330, dur: 60, preset: true },
-  { id: 'pre-monster', gender: 'male', name: 'Monster', cat: 'Character', pitch: 60, dur: 60, preset: true },
-  { id: 'pre-chip', gender: 'female', name: 'Chipmunk', cat: 'Effects', pitch: 400, dur: 60, preset: true },
-  { id: 'pre-robot', gender: 'male', name: 'Robot', cat: 'Effects', pitch: 140, fx: 'robot', dur: 60, preset: true },
-  { id: 'pre-alien', gender: 'female', name: 'Alien', cat: 'Effects', pitch: 300, fx: 'robot', dur: 60, preset: true },
-  { id: 'pre-whisper', gender: 'female', name: 'Whisper', cat: 'Effects', pitch: 160, fx: 'whisper', dur: 60, preset: true },
+  { id: 'pre-narrator', kv: 'bf_emma', gender: 'female', name: 'Female Narrator', cat: 'English', pitch: 210, dur: 60, preset: true },
+  { id: 'pre-anchor', kv: 'am_michael', gender: 'male', name: 'News Anchor', cat: 'Hindi', pitch: 115, dur: 60, preset: true },
+  { id: 'pre-char', kv: 'af_nova', gender: 'female', name: 'Character 1', cat: 'Custom', pitch: 290, dur: 180, preset: true },
+  { id: 'pre-deep', kv: 'bm_george', gender: 'male', name: 'Deep Voice', cat: 'English', pitch: 85, dur: 90, preset: true },
+  { id: 'pre-man', kv: 'am_adam', gender: 'male', name: 'Young Man', cat: 'Male', pitch: 125, dur: 60, preset: true },
+  { id: 'pre-elder', kv: 'bm_lewis', gender: 'male', name: 'Elderly Man', cat: 'Male', pitch: 100, dur: 60, preset: true },
+  { id: 'pre-woman', kv: 'af_sarah', gender: 'female', name: 'Soft Woman', cat: 'Female', pitch: 235, dur: 60, preset: true },
+  { id: 'pre-grand', kv: 'bf_isabella', gender: 'female', name: 'Elderly Woman', cat: 'Female', pitch: 195, dur: 60, preset: true },
+  { id: 'pre-child', kv: 'af_bella', gender: 'female', name: 'Child', cat: 'Character', pitch: 330, dur: 60, preset: true },
+  { id: 'pre-monster', kv: 'bm_george', gender: 'male', name: 'Monster', cat: 'Character', pitch: 60, dur: 60, preset: true },
+  { id: 'pre-chip', kv: 'af_nova', gender: 'female', name: 'Chipmunk', cat: 'Effects', pitch: 400, dur: 60, preset: true },
+  { id: 'pre-robot', kv: 'am_michael', gender: 'male', name: 'Robot', cat: 'Effects', pitch: 140, fx: 'robot', dur: 60, preset: true },
+  { id: 'pre-alien', kv: 'af_nova', gender: 'female', name: 'Alien', cat: 'Effects', pitch: 300, fx: 'robot', dur: 60, preset: true },
+  { id: 'pre-whisper', kv: 'af_heart', gender: 'female', name: 'Whisper', cat: 'Effects', pitch: 160, fx: 'whisper', dur: 60, preset: true },
 ];
 const CATEGORIES = ['Personal', 'English', 'Hindi', 'Male', 'Female', 'Character', 'Effects', 'Custom'];
 const S = {
@@ -259,6 +259,51 @@ function bufferSource(buf) {
   } };
 }
 
+/* ───────────── neural TTS (Kokoro, runs in the browser; ~90 MB model cached after first use) ───────────── */
+const KOKORO = { url: 'https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm', model: 'onnx-community/Kokoro-82M-v1.0-ONNX' };
+const KVOICES = [
+  ['am_adam', 'Adam', 'male', 'US'], ['am_michael', 'Michael', 'male', 'US'], ['am_eric', 'Eric', 'male', 'US'], ['am_liam', 'Liam', 'male', 'US'], ['am_onyx', 'Onyx', 'male', 'US'],
+  ['bm_george', 'George', 'male', 'UK'], ['bm_daniel', 'Daniel', 'male', 'UK'], ['bm_lewis', 'Lewis', 'male', 'UK'],
+  ['af_heart', 'Heart', 'female', 'US'], ['af_bella', 'Bella', 'female', 'US'], ['af_nicole', 'Nicole', 'female', 'US'], ['af_sarah', 'Sarah', 'female', 'US'], ['af_nova', 'Nova', 'female', 'US'],
+  ['bf_emma', 'Emma', 'female', 'UK'], ['bf_isabella', 'Isabella', 'female', 'UK'],
+].map(([id, name, gender, acc]) => ({ id, name, gender, acc }));
+let kokoroP = null;
+function loadKokoro(onProgress) {
+  return kokoroP || (kokoroP = (async () => {
+    const mod = await import((window.JV_CONFIG || {}).KOKORO_URL || KOKORO.url), files = {};
+    return mod.KokoroTTS.from_pretrained(KOKORO.model, { dtype: 'q8', device: 'wasm', progress_callback: p => {
+      if (p.status !== 'progress' || !p.total) return; files[p.file] = p;
+      const L = Object.values(files); onProgress?.(L.reduce((s, f) => s + f.loaded, 0) / L.reduce((s, f) => s + f.total, 0));
+    } });
+  })().catch(e => { kokoroP = null; throw e; }));
+}
+const splitText = (text, max = 220) => {
+  const out = []; let cur = '';
+  for (const s of text.match(/[^.!?।\n]+[.!?।]*/g) || [text]) { if (cur && (cur + s).length > max) { out.push(cur.trim()); cur = ''; } cur += s + ' '; }
+  if (cur.trim()) out.push(cur.trim()); return out;
+};
+/** True when the neural engine can't handle this request (Hindi script, or the user picked a device voice). */
+const needsDeviceVoice = (text, sysVoice) => /[\u0900-\u097F]/.test(text) || (sysVoice && !sysVoice.startsWith('k:'));
+/**
+ * Real male/female speech: synthesize with a neural base voice of the right gender, then move its pitch
+ * toward the saved voice (Similarity slider = how far) with the formant-preserving shifter.
+ * Resolves to { data, sr } (mono Float32).
+ */
+async function neuralSpeech(text, voice, st, onStatus) {
+  const tts = await loadKokoro(f => onStatus('load', f));
+  const kid = st.sysVoice?.startsWith('k:') ? st.sysVoice.slice(2) : voice.kv || (isMale(voice) ? 'am_adam' : 'af_heart');
+  const chunks = splitText(text), parts = [], speed = clamp(1.15 - .25 * st.stability, .85, 1.2); let sr = 24000;
+  for (let i = 0; i < chunks.length; i++) { onStatus('gen', i / chunks.length); const a = await tts.generate(chunks[i], { voice: kid, speed }); sr = a.sampling_rate; parts.push(a.audio); }
+  const gap = Math.round(sr * .12), n = parts.reduce((s, p) => s + p.length, 0) + gap * (parts.length - 1), data = new Float32Array(n);
+  let o = 0; parts.forEach(p => { data.set(p, o); o += p.length + gap; });
+  const base = ac().createBuffer(1, n, sr); base.copyToChannel(data, 0);
+  let out = { data, sr }; const bp = detectPitch(base), eff = 1 + ((voice.pitch || bp) / (bp || 1) - 1) * st.similarity;
+  if (bp && Math.abs(eff - 1) > .04) { const r = clamp(eff, .6, 1.8); out = psolaShift(base, r) || pitchShift(base, r); }
+  const fx = applyFx(out.data, out.sr, voice.fx); let peak = 0; for (let i = 0; i < fx.length; i++) peak = Math.max(peak, Math.abs(fx[i]));
+  if (peak > 0) for (let i = 0; i < fx.length; i++) fx[i] *= .9 / peak;
+  return { data: fx, sr: out.sr };
+}
+
 const FEMALE_RE = /female|woman|zira|samantha|susan|hazel|karen|victoria|moira|tessa|fiona|heera|kalpana|veena|serena|allison|ava|jenny|aria|google (us|uk) english(?! male)|google हिन्दी|google hindi/i;
 const MALE_RE = /\bmale\b|david|daniel|alex\b|fred|mark|george|guy|james|ryan|thomas|rishi|aaron|arthur|hemant|ravi|prabhat|oliver|christopher|eric|roger|steffan/i;
 const isMaleName = name => !FEMALE_RE.test(name) && MALE_RE.test(name);
@@ -373,9 +418,10 @@ function bindDropdowns(root) {
 }
 document.addEventListener('click', e => { if (!e.target.closest('.dd')) $$('.dd-list').forEach(l => { l.hidden = true; }); });
 const baseVoiceDropdown = (id, sel) => {
-  const items = (window.speechSynthesis?.getVoices() || []).filter(v => /^(en|hi)/i.test(v.lang))
-    .map(v => ({ value: v.name, label: v.name, sub: `${v.lang} • ${isMaleName(v.name) ? 'male' : FEMALE_RE.test(v.name) ? 'female' : 'unknown'}` }));
-  return ddHtml(id, [{ items: [{ value: '', label: 'Automatic', sub: 'match the voice’s male/female type' }, ...items] }], sel);
+  const dev = (window.speechSynthesis?.getVoices() || []).filter(v => /^(en|hi)/i.test(v.lang))
+    .map(v => ({ value: v.name, label: v.name, sub: `${v.lang} • ${isMaleName(v.name) ? 'male' : FEMALE_RE.test(v.name) ? 'female' : 'unknown'} • device` }));
+  const neural = KVOICES.map(v => ({ value: 'k:' + v.id, label: `${v.name} (${v.gender})`, sub: `${v.acc} English • neural` }));
+  return ddHtml(id, [{ items: [{ value: '', label: 'Automatic', sub: 'neural voice matching male/female' }] }, { title: 'Neural voices', items: neural }, ...(dev.length ? [{ title: 'Device voices (offline)', items: dev }] : [])], sel);
 };
 const voiceItem = v => ({ value: v.id, label: v.name, sub: `${v.cat}${v.pitch ? ` • ${v.pitch} Hz` : ''}${v.fx ? ` • ${v.fx}` : ''}` });
 const voiceDropdown = (id, sel) => ddHtml(id, [...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(voiceItem) }] : []), { title: 'Preset voices', items: PRESETS.map(voiceItem) }], sel);
@@ -443,7 +489,7 @@ V.home = () => {
 
 async function openRecent(id) {
   const a = S.recents.find(x => x.id === id); if (!a) return;
-  if (a.kind === 'tts') { S.ttsResult = { text: a.text, voiceId: a.voiceId, id: a.id }; return go('tts-result'); }
+  if (a.kind === 'tts') { const blob = await blobs.get('audio:' + id), buf = blob ? await decode(blob).catch(() => null) : null; S.ttsResult = { text: a.text, voiceId: a.voiceId, id: a.id, ...(buf ? { buf, blob } : {}) }; return go('tts-result'); }
   const blob = await blobs.get('audio:' + id); if (!blob) return toast('That audio is no longer stored');
   const buf = await decode(blob); S.v2vResult = { id, original: null, converted: buf, blob, ...(S.v2vResult?.id === id ? S.v2vResult : {}) }; go('v2v-result');
 }
@@ -551,7 +597,7 @@ V.tts = () => {
   const t = S.tts; t.voiceId = findVoice(t.voiceId) ? t.voiceId : allVoices()[0].id;
   return { html: `<section class="screen has-nav">${top('Text to Voice')}
     <label class="lbl" style="margin-top:0">Select Voice</label>${voiceDropdown('v', t.voiceId)}
-    <label class="lbl">Base voice <span class="muted" style="font-weight:400">– the device voice your clone is built on</span></label>${baseVoiceDropdown('sys', t.sysVoice)}
+    <label class="lbl">Base voice <span class="muted" style="font-weight:400">– the real voice your clone is built on</span></label>${baseVoiceDropdown('sys', t.sysVoice)}
     <label class="lbl">Enter Text</label><textarea class="field" id="txt" maxlength="5000" placeholder="Type what the voice should say…">${esc(t.text)}</textarea>
     <div class="muted" style="text-align:right"><span id="cnt">${t.text.length}</span>/5000</div>
     <label class="lbl">Voice Settings</label>
@@ -575,20 +621,33 @@ V.tts = () => {
 V['tts-result'] = () => {
   const res = S.ttsResult, v = res && findVoice(res.voiceId);
   if (!v) return { html: '', bind: () => go('tts') };
-  const src = speakSource(res.text, v, S.tts.stability, S.tts.similarity, S.tts.sysVoice);
-  return { html: `<section class="screen">${top('Generated Audio')}<div class="player">${playerHtml(fakePeaks(res.text.length), src.duration, true)}</div>
-    <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}</p>
-    <div class="actions"><button class="act" id="dl" disabled title="Browser speech can’t be exported">${icon('download')}Download</button>
-      <button class="act" id="sh">${icon('share')}Share</button><button class="act del" id="rm">${icon('trash')}Delete</button></div>
-    <div class="grow"></div><button class="btn" id="again">Generate Again</button></section>`,
-  bind: r => {
+  return { html: `<section class="screen">${top('Generated Audio')}<div id="body"><div class="player center"><div class="muted" id="status">Preparing…</div>
+    <div class="bar"><i id="barfill"></i></div></div></div></section>`,
+  bind: async r => {
+    const body = $('#body', r), gone = () => !r.isConnected, status = (t, f) => { if (gone()) return; $('#status', r).textContent = t; $('#barfill', r).style.width = Math.round((f || 0) * 100) + '%'; };
+    let buf = res.buf, blob = res.blob, device = false;
+    if (!buf) {
+      if (needsDeviceVoice(res.text, S.tts.sysVoice)) device = true;
+      else try {
+        const out = await neuralSpeech(res.text, v, S.tts, (k, f) => k === 'load' ? status(`Downloading voice engine (first time only)… ${Math.round(f * 100)}%`, f) : status('Generating speech…', f));
+        buf = ac().createBuffer(1, out.data.length, out.sr); buf.copyToChannel(out.data, 0); blob = encodeWav(out.data, out.sr);
+      } catch (e) { console.warn('[neural tts]', e); device = true; toast('Neural voice unavailable – using the device voice'); }
+    }
+    if (gone()) return;
+    const src = device ? speakSource(res.text, v, S.tts.stability, S.tts.similarity, S.tts.sysVoice.startsWith('k:') ? '' : S.tts.sysVoice) : bufferSource(buf);
+    body.innerHTML = `<div class="player">${playerHtml(device ? fakePeaks(res.text.length) : peaks(buf), src.duration, true)}</div>
+      <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${device ? ' (device voice)' : ''}</p>
+      <div class="actions"><button class="act" id="dl" ${device ? 'disabled' : ''}>${icon('download')}Download</button>
+        <button class="act" id="sh">${icon('share')}Share</button><button class="act del" id="rm">${icon('trash')}Delete</button></div>
+      <button class="btn" id="again">Generate Again</button>`;
     const p = bindPlayer($('.player', r), async () => src);
-    if (res.fresh) { res.fresh = false; const item = { id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); }
+    if (res.fresh) { res.fresh = false; const item = { id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); if (blob) blobs.put('audio:' + res.id, blob); }
     setTimeout(() => $('.play', r)?.click(), 250);
-    $('#again', r).onclick = () => { p(); $('.play', r).click(); };
-    $('#sh', r).onclick = () => navigator.share ? navigator.share({ title: 'JoloVocals', text: res.text }).catch(() => {}) : navigator.clipboard?.writeText(res.text).then(() => toast('Text copied'));
-    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); S.ttsResult = null; go('tts'); };
-    $('#dl', r).onclick = () => toast('Downloads need a server-side TTS engine');
+    $('#again', r).onclick = () => { if (device) { p(); $('.play', r).click(); } else { res.buf = res.blob = null; res.fresh = false; render(); } };
+    $('#sh', r).onclick = async () => { if (blob && navigator.canShare?.({ files: [new File([blob], 'jolovocals.wav', { type: 'audio/wav' })] })) return navigator.share({ files: [new File([blob], 'jolovocals.wav', { type: 'audio/wav' })] }).catch(() => {});
+      navigator.share ? navigator.share({ title: 'JoloVocals', text: res.text }).catch(() => {}) : navigator.clipboard?.writeText(res.text).then(() => toast('Text copied')); };
+    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); blobs.del('audio:' + res.id); S.ttsResult = null; go('tts'); };
+    $('#dl', r).onclick = () => { if (!blob) return; const l = document.createElement('a'); l.href = URL.createObjectURL(blob); l.download = `jolovocals-${res.id}.wav`; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 1000); };
   } };
 };
 

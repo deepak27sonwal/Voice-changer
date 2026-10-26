@@ -1,6 +1,7 @@
 // JoloVocals hosted voice API: a thin, authenticated proxy to ElevenLabs so the API key never reaches the browser.
 // Routes (POST, signed-in users only): /voices, /clone, /tts, /sts, /delete
 // Single file so it can be pasted straight into the Supabase dashboard editor. Function name: voice-api
+// History: generated audio is saved to our own storage + generation_history table and deleted from ElevenLabs' history.
 const EL = 'https://api.elevenlabs.io/v1';
 const MAX_SAMPLE = 12 * 1024 * 1024;
 const VOICE_ID = /^[A-Za-z0-9]{10,40}$/;
@@ -10,12 +11,13 @@ const EXPRESSIVE = /\[(?!pause\b)[a-z][^\]\n]{0,39}\]/i;
 const forV2 = (t: string) => t.replace(PAUSE, (_, s) => ` <break time="${Math.min(3, Number(s) || .5)}s" /> `).replace(/\[[^\]\n]{1,40}\]/g, '').replace(/\s+/g, ' ').trim();
 const forV3 = (t: string) => t.replace(PAUSE, (_, s) => Number(s) >= 1 ? ' … … ' : ' … ').replace(/\s+/g, ' ').trim();
 
-export interface Deps { elevenKey: string; supabaseUrl: string; anonKey: string; fetch?: typeof fetch }
+export interface Deps { elevenKey: string; supabaseUrl: string; anonKey: string; serviceKey?: string; fetch?: typeof fetch }
 
 const cors = {
   'access-control-allow-origin': '*',
   'access-control-allow-headers': 'authorization, apikey, content-type, x-client-info',
   'access-control-allow-methods': 'POST, OPTIONS',
+  'access-control-expose-headers': 'x-history-id',
 };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...cors, 'content-type': 'application/json' } });
 const clamp01 = (v: unknown, d: number) => { const n = Number(v); return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d; };
@@ -39,6 +41,7 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
   // Require a real signed-in user, not just the public app key (works whether or not "Verify JWT" is on).
   const who = await f(`${deps.supabaseUrl}/auth/v1/user`, { headers: { apikey: deps.anonKey, authorization: req.headers.get('authorization')! } });
   if (!who.ok) return json({ error: 'sign in required' }, 401);
+  const user = await who.json().catch(() => ({})) as { id?: string };
 
   const xi = { 'xi-api-key': deps.elevenKey };
   // Row-level security makes this query return only voices that belong to the caller.
@@ -66,6 +69,44 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
     return { stability: clamp01(b.stability, .5), similarity_boost: clamp01(b.similarity, .75), style: clamp01(b.style, 0),
       use_speaker_boost: b.boost === undefined || b.boost === null ? true : String(b.boost) !== 'false',
       ...(Number.isFinite(speed) ? { speed: Math.min(1.2, Math.max(.7, speed)) } : {}) };
+  };
+
+  // Removes a generation from the ElevenLabs account history. ElevenLabs returns its id in the `history-item-id` header;
+  // if it is missing, the newest items for that voice created since the request started are removed instead.
+  const forgetOnElevenLabs = async (itemId: string | null, voiceId: string, since: number) => {
+    try {
+      let ids = itemId ? [itemId] : [];
+      if (!ids.length) {
+        const h = await f(`${EL}/history?page_size=10&voice_id=${voiceId}`, { headers: xi });
+        if (h.ok) ids = ((await h.json()).history ?? []).filter((x: { date_unix: number }) => x.date_unix >= since - 5).map((x: { history_item_id: string }) => x.history_item_id);
+      }
+      for (const id of ids) {
+        const d = await f(`${EL}/history/${id}`, { method: 'DELETE', headers: xi });
+        if (!d.ok && d.status !== 404) console.error('[voice-api] could not delete ElevenLabs history item', id, d.status);
+      }
+    } catch (e) { console.error('[voice-api] ElevenLabs history cleanup failed', e); }
+  };
+  // Keeps the audio in our own storage (voice-audio/<user>/history/<id>.mp3) with a generation_history row.
+  const saveHistory = async (kind: 'tts' | 'sts', voiceId: string, model: string, text: string | null, audio: Uint8Array) => {
+    if (!deps.serviceKey || !user.id) { console.error('[voice-api] history not saved: missing service key or user'); return null; }
+    const id = crypto.randomUUID(), audioPath = `${user.id}/history/${id}.mp3`, auth = { apikey: deps.serviceKey, authorization: `Bearer ${deps.serviceKey}` };
+    try {
+      const up = await f(`${deps.supabaseUrl}/storage/v1/object/voice-audio/${audioPath}`, { method: 'POST', headers: { ...auth, 'content-type': 'audio/mpeg' }, body: audio });
+      if (!up.ok) throw new Error(`storage ${up.status}: ${await up.text()}`);
+      const row = await f(`${deps.supabaseUrl}/rest/v1/generation_history`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json', prefer: 'return=minimal' },
+        body: JSON.stringify({ id, user_id: user.id, kind, voice_id: voiceId, model, text, characters: text?.length ?? null, audio_path: audioPath, bytes: audio.length }) });
+      if (!row.ok) throw new Error(`history row ${row.status}: ${await row.text()}`);
+      return id;
+    } catch (e) { console.error('[voice-api] history save failed', e); return null; }
+  };
+  /** Sends successful audio to the caller after moving it from ElevenLabs' history to ours. */
+  const deliver = async (r: Response, kind: 'tts' | 'sts', voiceId: string, model: string, text: string | null, since: number) => {
+    if (!r.ok) return upstreamError(r);
+    const audio = new Uint8Array(await r.arrayBuffer());
+    // Only forget it on ElevenLabs once our copy is safely stored, so a failed save never loses the history.
+    const historyId = await saveHistory(kind, voiceId, model, text, audio);
+    if (historyId) await forgetOnElevenLabs(r.headers.get('history-item-id'), voiceId, since);
+    return new Response(audio, { headers: { ...cors, 'content-type': 'audio/mpeg', ...(historyId ? { 'x-history-id': historyId } : {}) } });
   };
 
   const path = new URL(req.url).pathname, route = path.split('/').filter(Boolean).pop();
@@ -99,17 +140,19 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       const speak = (model: string, body: string, voice_settings: unknown) => f(`${EL}/text-to-speech/${b.voice_id}?output_format=mp3_44100_128`, {
         method: 'POST', headers: { ...xi, 'content-type': 'application/json' }, body: JSON.stringify({ text: body, model_id: model, voice_settings }),
       });
-      let r: Response;
+      let r: Response, model = 'eleven_multilingual_v2';
+      const since = Math.floor(Date.now() / 1000);
       if (EXPRESSIVE.test(text)) {
+        model = 'eleven_v3';
         // eleven_v3 performs audio tags; it only accepts stability 0, 0.5 or 1.
         const vs = settings(b), stability = [0, .5, 1].reduce((p, c) => Math.abs(c - vs.stability) < Math.abs(p - vs.stability) ? c : p);
         r = await speak('eleven_v3', forV3(text), { stability, similarity_boost: vs.similarity_boost });
         if (!r.ok && ![401, 429].includes(r.status)) {
           console.error('[voice-api] eleven_v3 failed, retrying without tags', r.status, (await r.text()).slice(0, 200));
-          r = await speak('eleven_multilingual_v2', forV2(text), settings(b));
+          model = 'eleven_multilingual_v2'; r = await speak(model, forV2(text), settings(b));
         }
-      } else r = await speak('eleven_multilingual_v2', forV2(text), settings(b));
-      return r.ok ? new Response(r.body, { headers: { ...cors, 'content-type': 'audio/mpeg' } }) : upstreamError(r);
+      } else r = await speak(model, forV2(text), settings(b));
+      return deliver(r, 'tts', String(b.voice_id), model, text, since);
     }
 
     if (route === 'sts') {
@@ -122,8 +165,9 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       up.set('model_id', 'eleven_multilingual_sts_v2');
       up.set('voice_settings', JSON.stringify(settings({ stability: form.get('stability'), similarity: form.get('similarity'), style: form.get('style'), boost: form.get('boost') })));
       up.set('remove_background_noise', 'true');
+      const since = Math.floor(Date.now() / 1000);
       const r = await f(`${EL}/speech-to-speech/${id}?output_format=mp3_44100_128`, { method: 'POST', headers: xi, body: up });
-      return r.ok ? new Response(r.body, { headers: { ...cors, 'content-type': 'audio/mpeg' } }) : upstreamError(r);
+      return deliver(r, 'sts', id, 'eleven_multilingual_sts_v2', null, since);
     }
 
     if (route === 'delete') {
@@ -144,5 +188,6 @@ if (typeof Deno !== 'undefined') {
     elevenKey: Deno.env.get('ELEVENLABS_API_KEY') ?? '',
     supabaseUrl: Deno.env.get('SUPABASE_URL')!,
     anonKey: Deno.env.get('SUPABASE_ANON_KEY')!,
+    serviceKey: Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
   }));
 }

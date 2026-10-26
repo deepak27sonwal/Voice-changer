@@ -9,13 +9,12 @@ Splash → Login/Sign up → Home → Create Voice (upload/record) → Consent �
 
 ## What is real vs. demo
 - **Voice to Voice**: real. Detects the pitch of your audio (autocorrelation), then shifts it toward the target voice's pitch with a duration-preserving WSOLA pitch shifter. Download as WAV.
-- **Create Voice**: records/uploads a sample and stores a *voice profile* (average pitch + the sample) in IndexedDB. This is not neural cloning.
-- **Text to Voice**: real neural speech. [Kokoro](https://github.com/hexgrad/kokoro) (82M-parameter open model, via `kokoro-js`) runs in the browser with a male or female base voice, then the app moves its pitch toward your saved voice with the formant-preserving shifter. The Similarity slider sets how far, Stability sets speed. The model (~90 MB) downloads on first use and is cached. Output is exportable WAV. English only: Hindi text, or a chosen device voice, falls back to the browser's SpeechSynthesis (no download). This is not timbre cloning.
+- **Create Voice**: records/uploads a sample and stores a *voice profile* (average pitch + the sample). With hosted voices on, the sample is also cloned on ElevenLabs (paid ElevenLabs plans only).
+- **Text to Voice**: ElevenLabs speech through the `voice-api` function (see below). Voices without their own ElevenLabs voice (presets, local voices) speak through an ElevenLabs voice of the same gender, shaped toward their pitch and effect. Without ElevenLabs, or if it fails, the browser's SpeechSynthesis is used (not exportable).
 - **Auth** is a local demo (stored in this browser only); Google/mobile sign-in are stubs.
 
 For true timbre cloning, put a model API (e.g. an RVC/XTTS service) behind the Create/TTS/Convert steps in `app.js`.
 
-`config.js` may set `KOKORO_URL` to self-host the engine module.
 
 ## Hosted voice cloning (optional, real timbre cloning)
 The in-browser path matches pitch only. For voices that actually sound like the speaker, deploy the `voice-api` Edge Function, which proxies ElevenLabs so the API key stays on the server:

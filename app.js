@@ -95,20 +95,20 @@ const blobs = {
 };
 
 const PRESETS = [
-  { id: 'pre-narrator', kv: 'bf_emma', gender: 'female', name: 'Female Narrator', cat: 'English', pitch: 210, dur: 60, preset: true },
-  { id: 'pre-anchor', kv: 'am_michael', gender: 'male', name: 'News Anchor', cat: 'Hindi', pitch: 115, dur: 60, preset: true },
-  { id: 'pre-char', kv: 'af_nova', gender: 'female', name: 'Character 1', cat: 'Custom', pitch: 290, dur: 180, preset: true },
-  { id: 'pre-deep', kv: 'bm_george', gender: 'male', name: 'Deep Voice', cat: 'English', pitch: 85, dur: 90, preset: true },
-  { id: 'pre-man', kv: 'am_adam', gender: 'male', name: 'Young Man', cat: 'Male', pitch: 125, dur: 60, preset: true },
-  { id: 'pre-elder', kv: 'bm_lewis', gender: 'male', name: 'Elderly Man', cat: 'Male', pitch: 100, dur: 60, preset: true },
-  { id: 'pre-woman', kv: 'af_sarah', gender: 'female', name: 'Soft Woman', cat: 'Female', pitch: 235, dur: 60, preset: true },
-  { id: 'pre-grand', kv: 'bf_isabella', gender: 'female', name: 'Elderly Woman', cat: 'Female', pitch: 195, dur: 60, preset: true },
-  { id: 'pre-child', kv: 'af_bella', gender: 'female', name: 'Child', cat: 'Character', pitch: 330, dur: 60, preset: true },
-  { id: 'pre-monster', kv: 'bm_george', gender: 'male', name: 'Monster', cat: 'Character', pitch: 60, dur: 60, preset: true },
-  { id: 'pre-chip', kv: 'af_nova', gender: 'female', name: 'Chipmunk', cat: 'Effects', pitch: 400, dur: 60, preset: true },
-  { id: 'pre-robot', kv: 'am_michael', gender: 'male', name: 'Robot', cat: 'Effects', pitch: 140, fx: 'robot', dur: 60, preset: true },
-  { id: 'pre-alien', kv: 'af_nova', gender: 'female', name: 'Alien', cat: 'Effects', pitch: 300, fx: 'robot', dur: 60, preset: true },
-  { id: 'pre-whisper', kv: 'af_heart', gender: 'female', name: 'Whisper', cat: 'Effects', pitch: 160, fx: 'whisper', dur: 60, preset: true },
+  { id: 'pre-narrator', gender: 'female', name: 'Female Narrator', cat: 'English', pitch: 210, dur: 60, preset: true },
+  { id: 'pre-anchor', gender: 'male', name: 'News Anchor', cat: 'Hindi', pitch: 115, dur: 60, preset: true },
+  { id: 'pre-char', gender: 'female', name: 'Character 1', cat: 'Custom', pitch: 290, dur: 180, preset: true },
+  { id: 'pre-deep', gender: 'male', name: 'Deep Voice', cat: 'English', pitch: 85, dur: 90, preset: true },
+  { id: 'pre-man', gender: 'male', name: 'Young Man', cat: 'Male', pitch: 125, dur: 60, preset: true },
+  { id: 'pre-elder', gender: 'male', name: 'Elderly Man', cat: 'Male', pitch: 100, dur: 60, preset: true },
+  { id: 'pre-woman', gender: 'female', name: 'Soft Woman', cat: 'Female', pitch: 235, dur: 60, preset: true },
+  { id: 'pre-grand', gender: 'female', name: 'Elderly Woman', cat: 'Female', pitch: 195, dur: 60, preset: true },
+  { id: 'pre-child', gender: 'female', name: 'Child', cat: 'Character', pitch: 330, dur: 60, preset: true },
+  { id: 'pre-monster', gender: 'male', name: 'Monster', cat: 'Character', pitch: 60, dur: 60, preset: true },
+  { id: 'pre-chip', gender: 'female', name: 'Chipmunk', cat: 'Effects', pitch: 400, dur: 60, preset: true },
+  { id: 'pre-robot', gender: 'male', name: 'Robot', cat: 'Effects', pitch: 140, fx: 'robot', dur: 60, preset: true },
+  { id: 'pre-alien', gender: 'female', name: 'Alien', cat: 'Effects', pitch: 300, fx: 'robot', dur: 60, preset: true },
+  { id: 'pre-whisper', gender: 'female', name: 'Whisper', cat: 'Effects', pitch: 160, fx: 'whisper', dur: 60, preset: true },
 ];
 const CATEGORIES = ['Personal', 'English', 'Hindi', 'Male', 'Female', 'Character', 'Effects', 'Custom'];
 const VS_DEFAULTS = { stability: .7, similarity: .6, style: 0, speed: 1, pitch: 0, volume: 1, boost: true };
@@ -126,12 +126,14 @@ const S = {
 };
 const allVoices = () => [...S.voices, ...S.elVoices, ...PRESETS];
 const LANGS = { hi: 'Hindi', en: 'English', kn: 'Kannada', ta: 'Tamil', te: 'Telugu', mr: 'Marathi', bn: 'Bengali', pt: 'Portuguese', de: 'German', nl: 'Dutch', it: 'Italian', tr: 'Turkish' };
-/** Best ElevenLabs voice for Hindi speech of a gender (skips character/kids voices); undefined if none. */
-const hindiElVoice = male => {
+/**
+ * ElevenLabs voice that speaks for a voice without its own (presets, local voices): same gender, calm rather than a
+ * character voice, a native Hindi voice for Hindi when the plan allows it, else English. Undefined if none.
+ */
+const elVoiceFor = (male, hindi) => {
   const g = male ? 'male' : 'female', calm = v => !/kids|character|story|trickster|warrior|quirky/i.test(v.name);
-  // Native Hindi voices first; otherwise any voice of that gender (the multilingual model speaks Hindi with it).
-  const hi = S.elVoices.filter(v => v.lang === 'hi' && v.gender === g), any = S.elVoices.filter(v => v.gender === g);
-  return hi.find(calm) || hi[0] || any.find(calm) || any[0];
+  const pool = S.elVoices.filter(v => v.gender === g), lang = l => pool.filter(v => v.lang === l);
+  return [...(hindi ? [lang('hi')] : []), lang('en'), pool].map(p => p.find(calm) || p[0]).find(Boolean);
 };
 /** Fetch the ElevenLabs account's own voices through voice-api; re-render screens that list voices. */
 async function loadElVoices() {
@@ -303,44 +305,6 @@ function bufferSource(buf) {
   } };
 }
 
-/* ───────────── neural TTS (Kokoro, runs in the browser; ~90 MB model cached after first use) ───────────── */
-const KOKORO = { url: 'https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm', model: 'onnx-community/Kokoro-82M-v1.0-ONNX' };
-const KVOICES = [
-  ['am_adam', 'Adam', 'male', 'US'], ['am_michael', 'Michael', 'male', 'US'], ['am_eric', 'Eric', 'male', 'US'], ['am_liam', 'Liam', 'male', 'US'], ['am_onyx', 'Onyx', 'male', 'US'],
-  ['bm_george', 'George', 'male', 'UK'], ['bm_daniel', 'Daniel', 'male', 'UK'], ['bm_lewis', 'Lewis', 'male', 'UK'],
-  ['af_heart', 'Heart', 'female', 'US'], ['af_bella', 'Bella', 'female', 'US'], ['af_nicole', 'Nicole', 'female', 'US'], ['af_sarah', 'Sarah', 'female', 'US'], ['af_nova', 'Nova', 'female', 'US'],
-  ['bf_emma', 'Emma', 'female', 'UK'], ['bf_isabella', 'Isabella', 'female', 'UK'],
-].map(([id, name, gender, acc]) => ({ id, name, gender, acc }));
-/** Worker client for the neural engine (tts-worker.js). One shared worker; `reset()` kills it (cancel / retry). */
-const neural = (() => {
-  let c = null;
-  const reset = () => { if (c) { c.w.terminate(); c.pending.forEach(p => p.rej(new Error('cancelled'))); } c = null; };
-  const start = () => {
-    if (c) return c;
-    const w = new Worker('tts-worker.js', { type: 'module' }), me = c = { w, listeners: new Set(), pending: new Map(), ready: null, fail: null };
-    w.onmessage = ({ data: m }) => {
-      if (m.type === 'audio') { me.pending.get(m.id)?.res(m); me.pending.delete(m.id); }
-      else if (m.type === 'error') { const p = me.pending.get(m.id); if (p) { p.rej(new Error(m.message)); me.pending.delete(m.id); } else me.fail(new Error(m.message)); }
-      else me.listeners.forEach(l => l(m));
-    };
-    w.onerror = e => me.fail(new Error(e.message || 'engine failed to start'));
-    me.ready = new Promise((res, rej) => { me.fail = rej; me.listeners.add(m => m.type === 'ready' && res()); });
-    me.ready.catch(() => { if (c === me) reset(); });
-    w.postMessage({ type: 'load', url: (window.JV_CONFIG || {}).KOKORO_URL || KOKORO.url, model: KOKORO.model });
-    return me;
-  };
-  const timeout = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} timed out`)), ms))]);
-  return {
-    reset,
-    load: (onEvent, idleMs = 240000) => { const me = start(); me.listeners.add(onEvent); return timeout(me.ready, idleMs, 'Loading the voice engine').finally(() => me.listeners.delete(onEvent)); },
-    generate: (text, voice, speed) => { const me = start(), id = uid(); return timeout(new Promise((res, rej) => { me.pending.set(id, { res, rej }); me.w.postMessage({ type: 'gen', id, text, voice, speed }); }), 180000, 'Generating speech'); },
-  };
-})();
-const splitText = (text, max = 220) => {
-  const out = []; let cur = '';
-  for (const s of text.match(/[^.!?।\n]+[.!?।]*/g) || [text]) { if (cur && (cur + s).length > max) { out.push(cur.trim()); cur = ''; } cur += s + ' '; }
-  if (cur.trim()) out.push(cur.trim()); return out;
-};
 /* Text tags: [pause 1s] works with every engine; expressive tags ([laughs], [whispers]…) are performed by ElevenLabs and dropped elsewhere. */
 const TAG_GROUPS = [
   ['Emotion', ['happy', 'sad', 'excited', 'angry', 'calm', 'curious', 'sarcastic']],
@@ -357,36 +321,17 @@ const tagSegments = text => {
 };
 const stripTags = text => tagSegments(text).map(s => s.text).filter(Boolean).join('. ');
 
-/** True when the neural engine can't handle this request (Hindi script, or the user picked a device voice). */
-const needsDeviceVoice = (text, sysVoice) => /[\u0900-\u097F]/.test(text) || (sysVoice && !sysVoice.startsWith('k:'));
 /**
- * Real male/female speech: synthesize with a neural base voice of the right gender, then move its pitch
- * toward the saved voice (Similarity slider = how far) with the formant-preserving shifter.
- * Resolves to { data, sr } (mono Float32).
+ * Shapes stand-in ElevenLabs audio toward a preset or local voice: moves its pitch toward the voice's pitch
+ * (Similarity slider = how far; small shifts are skipped because they add artifacts) and applies its effect.
+ * Returns a new AudioBuffer, or null when nothing changes.
  */
-async function neuralSpeech(text, voice, st, onStatus, cancelled = () => false) {
-  await neural.load(m => { if (m.type === 'stage') onStatus(m.text, null); else if (m.type === 'progress') onStatus(`Downloading voice model… ${Math.round(m.f * 100)}%`, m.f); });
-  const kid = st.sysVoice?.startsWith('k:') ? st.sysVoice.slice(2) : voice.kv || (isMale(voice) ? 'am_adam' : 'af_heart');
-  const chunks = [], gaps = [];
-  tagSegments(text).forEach(seg => { const c = seg.text ? splitText(seg.text) : []; c.forEach((t, i) => { chunks.push(t); gaps.push(i === c.length - 1 ? Math.max(.12, seg.pause) : .12); }); if (!c.length && gaps.length) gaps[gaps.length - 1] += seg.pause; });
-  if (!chunks.length) throw new Error('nothing to say');
-  const parts = [], speed = clamp(st.speed ?? 1, .7, 1.2); let sr = 24000;
-  for (let i = 0; i < chunks.length; i++) {
-    if (cancelled()) throw new Error('cancelled');
-    onStatus(`Generating speech… ${i + 1}/${chunks.length}`, i / chunks.length);
-    const a = await neural.generate(chunks[i], kid, speed); sr = a.sr; parts.push(a.audio);
-  }
-  onStatus('Matching your voice…', 1); await sleep(30);
-  const gapLen = i => i < parts.length - 1 ? Math.round(sr * gaps[i]) : 0;
-  const n = parts.reduce((s, p, i) => s + p.length + gapLen(i), 0), data = new Float32Array(n);
-  let o = 0; parts.forEach((p, i) => { data.set(p, o); o += p.length + gapLen(i); });
-  const base = ac().createBuffer(1, n, sr); base.copyToChannel(data, 0);
-  let out = { data, sr }; const bp = detectPitch(base), eff = 1 + ((voice.pitch || bp) / (bp || 1) - 1) * st.similarity;
-  // shifts under ~12% add artifacts without being audible, so skip them
-  if (bp && Math.abs(eff - 1) > .12) { const r = clamp(eff, .75, 1.35); out = psolaShift(base, r) || pitchShift(base, r); }
-  const fx = applyFx(out.data, out.sr, voice.fx); let peak = 0; for (let i = 0; i < fx.length; i++) peak = Math.max(peak, Math.abs(fx[i]));
-  if (peak > 0) for (let i = 0; i < fx.length; i++) fx[i] *= .9 / peak;
-  return { data: fx, sr: out.sr };
+function shapeToVoice(buf, voice, similarity) {
+  let data = null; const bp = voice.pitch ? detectPitch(buf) : 0, eff = bp ? 1 + (voice.pitch / bp - 1) * similarity : 1;
+  if (Math.abs(eff - 1) > .12) { const r = clamp(eff, .75, 1.35); data = (psolaShift(buf, r) || pitchShift(buf, r)).data; }
+  if (voice.fx) data = applyFx(data || mono(buf), buf.sampleRate, voice.fx);
+  if (!data) return null;
+  const out = ac().createBuffer(1, data.length, buf.sampleRate); out.copyToChannel(data, 0); return out;
 }
 
 const FEMALE_RE = /female|woman|zira|samantha|susan|hazel|karen|victoria|moira|tessa|fiona|heera|kalpana|veena|serena|allison|ava|jenny|aria|google (us|uk) english(?! male)|google हिन्दी|google hindi/i;
@@ -534,8 +479,7 @@ document.addEventListener('click', e => { if (!e.target.closest('.dd')) $$('.dd-
 const baseVoiceDropdown = (id, sel) => {
   const dev = (window.speechSynthesis?.getVoices() || []).filter(v => /^(en|hi)/i.test(v.lang))
     .map(v => ({ value: v.name, label: v.name, sub: `${v.lang} • ${isMaleName(v.name) ? 'male' : FEMALE_RE.test(v.name) ? 'female' : 'unknown'} • device` }));
-  const neural = KVOICES.map(v => ({ value: 'k:' + v.id, label: `${v.name} (${v.gender})`, sub: `${v.acc} English • neural` }));
-  return ddHtml(id, [{ items: [{ value: '', label: 'Automatic', sub: 'neural voice matching male/female' }] }, { title: 'Neural voices', items: neural }, ...(dev.length ? [{ title: 'Device voices (offline)', items: dev }] : [])], sel);
+  return ddHtml(id, [{ items: [{ value: '', label: 'Automatic', sub: 'device voice matching male/female' }] }, ...(dev.length ? [{ title: 'Device voices', items: dev }] : [])], sel);
 };
 const voiceItem = v => ({ value: v.id, label: v.name, sub: `${v.gender && v.el ? v.gender + ' • ' : ''}${v.cat}${v.pitch ? ` • ${v.pitch} Hz` : ''}${v.fx ? ` • ${v.fx}` : ''}` });
 const voiceDropdown = (id, sel) => {
@@ -723,7 +667,7 @@ V.tts = () => {
   const t = S.tts; t.voiceId = findVoice(t.voiceId) ? t.voiceId : allVoices()[0].id;
   return { html: `<section class="screen has-nav">${top('Text to Voice')}
     <label class="lbl" style="margin-top:0">Select Voice</label>${voiceDropdown('v', t.voiceId)}
-    <label class="lbl">Base voice <span class="muted" style="font-weight:400">– the real voice your clone is built on</span></label>${baseVoiceDropdown('sys', t.sysVoice)}
+    <label class="lbl">Offline voice <span class="muted" style="font-weight:400">– used only when ElevenLabs is unavailable</span></label>${baseVoiceDropdown('sys', t.sysVoice)}
     <label class="lbl">Enter Text</label>
     <div class="tags" aria-label="Insert a tag">${TAG_GROUPS.map(([g, tags]) => `<div class="tag-row"><span class="muted">${g}</span>${tags.map(x => `<button type="button" class="tag" data-tag="${x}">${x}</button>`).join('')}</div>`).join('')}</div>
     <textarea class="field" id="txt" maxlength="5000" placeholder="Type what the voice should say…">${esc(t.text)}</textarea>
@@ -756,46 +700,33 @@ V['tts-result'] = () => {
   if (!v) return { html: '', bind: () => go('tts') };
   return { html: `<section class="screen">${top('Generated Audio')}<div id="body"><div class="player center"><div class="muted" id="status">Preparing…</div>
     <div class="bar"><i id="barfill"></i></div><div class="muted" id="elapsed" style="margin-top:8px;font-size:12px"></div></div>
-    <p class="muted center" style="margin:14px 0">The first time downloads the voice model (about 90 MB) and may take a minute on slow connections.</p>
-    <button class="btn outline" id="usedev">Use device voice instead</button><div class="gap"></div><button class="btn ghost" id="cancel">Cancel</button></div></section>`,
+    <div class="gap"></div><button class="btn ghost" id="cancel">Cancel</button></div></section>`,
   bind: async r => {
     const body = $('#body', r), gone = () => !r.isConnected;
-    let cancelled = false, device = false, buf = res.buf, blob = res.blob, hindiEl = null;
+    let cancelled = false, device = false, buf = res.buf, blob = res.blob, standIn = null;
     const t0 = Date.now(), tick = setInterval(() => { if (gone()) return clearInterval(tick); $('#elapsed', r).textContent = `${Math.round((Date.now() - t0) / 1000)} s`; }, 500);
     const status = (t, f) => { if (gone()) return; $('#status', r).textContent = t; if (f != null) $('#barfill', r).style.width = Math.round(f * 100) + '%'; };
     if (!buf) {
-      $('#cancel', r).onclick = () => { cancelled = true; neural.reset(); go('tts'); };
-      $('#usedev', r).onclick = () => { device = true; neural.reset(); startDevice(); };
-      let startDevice = () => {};
-      // Hindi without a hosted voice of its own → use the account's ElevenLabs Hindi voice of the same gender
-      hindiEl = !v.remote && cloud.hosted && (v.cat === 'Hindi' || /[\u0900-\u097F]/.test(res.text)) ? hindiElVoice(isMale(v)) : null;
-      const hostedId = v.remote || hindiEl?.remote;
+      $('#cancel', r).onclick = () => { cancelled = true; go('tts'); };
+      // Voices without their own ElevenLabs voice speak through an ElevenLabs voice of the same gender
+      standIn = !v.remote && cloud.hosted ? elVoiceFor(isMale(v), v.cat === 'Hindi' || /[\u0900-\u097F]/.test(res.text)) : null;
+      const hostedId = v.remote || standIn?.remote;
       if (hostedId) {
         try {
-          status('Generating with your cloned voice…', .3);
+          status('Generating speech…', .3);
           blob = await (await cloud.fn('tts', JSON.stringify({ voice_id: hostedId, text: res.text, stability: S.vs.stability, similarity: S.vs.similarity, style: S.vs.style, speed: S.vs.speed, boost: S.vs.boost }))).blob();
           buf = await decode(blob);
-        } catch (e) { if (cancelled) return; blob = null; toast(`Hosted voice unavailable (${String(e.message).slice(0, 60)}) – using the built-in voice`); }
+          if (standIn) { const s = shapeToVoice(buf, v, S.vs.similarity); if (s) { buf = s; blob = encodeWav(mono(s), s.sampleRate); } }
+        } catch (e) { if (cancelled) return; buf = blob = null; toast(`ElevenLabs unavailable (${String(e.message).slice(0, 60)}) – using the device voice`); }
       }
-      if (buf) { /* hosted audio ready */ }
-      else if (needsDeviceVoice(res.text, S.tts.sysVoice)) device = true;
-      else {
-        try {
-          const out = await new Promise((resolve, reject) => {
-            startDevice = () => resolve(null);
-            neuralSpeech(res.text, v, { ...S.tts, ...S.vs }, status, () => cancelled || device).then(resolve, reject);
-          });
-          if (out) { buf = ac().createBuffer(1, out.data.length, out.sr); buf.copyToChannel(out.data, 0); blob = encodeWav(out.data, out.sr); }
-        } catch (e) { if (cancelled) return; console.warn('[neural tts]', e); device = true; toast(`Neural voice unavailable (${String(e.message || e).slice(0, 60)}) – using the device voice`); }
-        if (!buf) device = true;
-      }
+      if (!buf) device = true;
     }
     clearInterval(tick);
     if (gone()) return;
     if (buf && !res.buf) { const c = applyControls(buf); if (c) { buf = c; blob = encodeWav(mono(c), c.sampleRate); } }
-    const src = device ? speakSource(res.text, v, S.vs.stability, S.vs.similarity, S.tts.sysVoice.startsWith('k:') ? '' : S.tts.sysVoice, S.vs) : bufferSource(buf);
+    const src = device ? speakSource(res.text, v, S.vs.stability, S.vs.similarity, S.tts.sysVoice, S.vs) : bufferSource(buf);
     body.innerHTML = `<div class="player">${playerHtml(device ? fakePeaks(res.text.length) : peaks(buf), src.duration, true)}</div>
-      <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${hindiEl && buf ? ` (ElevenLabs ${esc(hindiEl.name.split(' - ')[0])})` : ''}${device ? ' (device voice)' : ''}</p>
+      <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${standIn && buf ? ` (ElevenLabs ${esc(standIn.name.split(' - ')[0])})` : ''}${device ? ' (device voice)' : ''}</p>
       <div class="actions"><button class="act" id="dl" ${device ? 'disabled' : ''}>${icon('download')}Download</button>
         <button class="act" id="sh">${icon('share')}Share</button><button class="act del" id="rm">${icon('trash')}Delete</button></div>
       <button class="btn" id="again">Generate Again</button>`;

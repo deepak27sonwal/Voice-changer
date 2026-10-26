@@ -59,3 +59,23 @@ create policy "own audio update" on storage.objects for update to authenticated
 drop policy if exists "own audio delete" on storage.objects;
 create policy "own audio delete" on storage.objects for delete to authenticated
   using (bucket_id = 'voice-audio' and (storage.foldername(name))[1] = (select auth.uid())::text);
+
+-- Server-side history of ElevenLabs generations (the voice-api function deletes them from ElevenLabs' own history).
+-- Rows and audio files are written only by the function (service role); users can read their own.
+create table if not exists public.generation_history (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users(id) on delete cascade,
+  kind        text not null check (kind in ('tts', 'sts')),
+  voice_id    text not null,
+  model       text not null,
+  text        text,
+  characters  integer,
+  audio_path  text not null,
+  bytes       integer,
+  created_at  timestamptz not null default now()
+);
+create index if not exists generation_history_user_created on public.generation_history (user_id, created_at desc);
+alter table public.generation_history enable row level security;
+drop policy if exists "own history read" on public.generation_history;
+create policy "own history read" on public.generation_history for select to authenticated
+  using (user_id = (select auth.uid()));

@@ -176,3 +176,17 @@ input[type=range] { width: 100%; accent-color: var(--p); }
 
 .bar { height: 8px; border-radius: 99px; background: var(--line); margin-top: 14px; overflow: hidden; }
 .bar i { display: block; height: 100%; width: 0; background: var(--grad); transition: width .2s; }
+
+/* voice control settings panel */
+.vs { border: 1px solid var(--line); border-radius: 14px; padding: 4px 14px 12px; margin: 14px 0; background: #faf9ff; }
+.vs summary { cursor: pointer; font-weight: 600; font-size: 14px; padding: 10px 0 4px; list-style-position: inside; }
+.vs .slider { grid-template-columns: 80px 1fr 56px; }
+.vs .slider b { text-align: right; font-size: 13px; font-weight: 600; }
+
+/* text tags */
+.tags { display: grid; gap: 6px; margin-bottom: 8px; }
+.tag-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.tag-row > span { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; width: 64px; }
+.tag { border: 1px solid var(--line); background: #fff; color: var(--p); border-radius: 99px; padding: 5px 10px; font: 500 12px inherit; font-family: inherit; cursor: pointer; }
+.tag:hover { background: var(--soft); }
+.tag::before { content: "["; opacity: .5; } .tag::after { content: "]"; opacity: .5; }

@@ -111,13 +111,15 @@ const PRESETS = [
   { id: 'pre-whisper', kv: 'af_heart', gender: 'female', name: 'Whisper', cat: 'Effects', pitch: 160, fx: 'whisper', dur: 60, preset: true },
 ];
 const CATEGORIES = ['Personal', 'English', 'Hindi', 'Male', 'Female', 'Character', 'Effects', 'Custom'];
+const VS_DEFAULTS = { stability: .7, similarity: .6, style: 0, speed: 1, pitch: 0, volume: 1, boost: true };
 const S = {
   user: ls.get('user', null),
   voices: ls.get('voices', []),
   recents: ls.get('recents', []),
   draft: null,                  // voice being created: { blob, buf, dur }
   consent: false,
-  tts: { sysVoice: ls.get('sysvoice', ''), voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.', stability: .7, similarity: .6 },
+  tts: { sysVoice: ls.get('sysvoice', ''), voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.' },
+  vs: { ...VS_DEFAULTS, ...ls.get('voicesettings', {}) },   // voice control settings, shared by Text to Voice and Voice to Voice
   ttsResult: null, v2v: { sample: null, voiceId: null }, v2vResult: null,
   libTab: 'mine', libQuery: '', stopPlayback: null,
   elVoices: ls.get('elvoices', []),   // voices from the ElevenLabs account (hosted mode)
@@ -339,6 +341,22 @@ const splitText = (text, max = 220) => {
   for (const s of text.match(/[^.!?।\n]+[.!?।]*/g) || [text]) { if (cur && (cur + s).length > max) { out.push(cur.trim()); cur = ''; } cur += s + ' '; }
   if (cur.trim()) out.push(cur.trim()); return out;
 };
+/* Text tags: [pause 1s] works with every engine; expressive tags ([laughs], [whispers]…) are performed by ElevenLabs and dropped elsewhere. */
+const TAG_GROUPS = [
+  ['Emotion', ['happy', 'sad', 'excited', 'angry', 'calm', 'curious', 'sarcastic']],
+  ['Delivery', ['whispers', 'shouts', 'laughs', 'sighs', 'clears throat']],
+  ['Pause', ['pause 0.5s', 'pause 1s', 'pause 2s']],
+];
+const PAUSE_TAG = /\[pause\s*([\d.]+)\s*s\]/gi;
+/** Splits text at [pause Ns] tags and removes other tags: [{ text, pause }] with pause in seconds after each piece. */
+const tagSegments = text => {
+  const out = []; let last = 0, m; PAUSE_TAG.lastIndex = 0;
+  while ((m = PAUSE_TAG.exec(text))) { out.push({ text: text.slice(last, m.index), pause: Math.min(3, +m[1] || .5) }); last = PAUSE_TAG.lastIndex; }
+  out.push({ text: text.slice(last), pause: 0 });
+  return out.map(s => ({ ...s, text: s.text.replace(/\[[^\]\n]{1,40}\]/g, ' ').replace(/\s+/g, ' ').trim() }));
+};
+const stripTags = text => tagSegments(text).map(s => s.text).filter(Boolean).join('. ');
+
 /** True when the neural engine can't handle this request (Hindi script, or the user picked a device voice). */
 const needsDeviceVoice = (text, sysVoice) => /[\u0900-\u097F]/.test(text) || (sysVoice && !sysVoice.startsWith('k:'));
 /**
@@ -349,15 +367,19 @@ const needsDeviceVoice = (text, sysVoice) => /[\u0900-\u097F]/.test(text) || (sy
 async function neuralSpeech(text, voice, st, onStatus, cancelled = () => false) {
   await neural.load(m => { if (m.type === 'stage') onStatus(m.text, null); else if (m.type === 'progress') onStatus(`Downloading voice model… ${Math.round(m.f * 100)}%`, m.f); });
   const kid = st.sysVoice?.startsWith('k:') ? st.sysVoice.slice(2) : voice.kv || (isMale(voice) ? 'am_adam' : 'af_heart');
-  const chunks = splitText(text), parts = [], speed = clamp(1.15 - .25 * st.stability, .85, 1.2); let sr = 24000;
+  const chunks = [], gaps = [];
+  tagSegments(text).forEach(seg => { const c = seg.text ? splitText(seg.text) : []; c.forEach((t, i) => { chunks.push(t); gaps.push(i === c.length - 1 ? Math.max(.12, seg.pause) : .12); }); if (!c.length && gaps.length) gaps[gaps.length - 1] += seg.pause; });
+  if (!chunks.length) throw new Error('nothing to say');
+  const parts = [], speed = clamp(st.speed ?? 1, .7, 1.2); let sr = 24000;
   for (let i = 0; i < chunks.length; i++) {
     if (cancelled()) throw new Error('cancelled');
     onStatus(`Generating speech… ${i + 1}/${chunks.length}`, i / chunks.length);
     const a = await neural.generate(chunks[i], kid, speed); sr = a.sr; parts.push(a.audio);
   }
   onStatus('Matching your voice…', 1); await sleep(30);
-  const gap = Math.round(sr * .12), n = parts.reduce((s, p) => s + p.length, 0) + gap * (parts.length - 1), data = new Float32Array(n);
-  let o = 0; parts.forEach(p => { data.set(p, o); o += p.length + gap; });
+  const gapLen = i => i < parts.length - 1 ? Math.round(sr * gaps[i]) : 0;
+  const n = parts.reduce((s, p, i) => s + p.length + gapLen(i), 0), data = new Float32Array(n);
+  let o = 0; parts.forEach((p, i) => { data.set(p, o); o += p.length + gapLen(i); });
   const base = ac().createBuffer(1, n, sr); base.copyToChannel(data, 0);
   let out = { data, sr }; const bp = detectPitch(base), eff = 1 + ((voice.pitch || bp) / (bp || 1) - 1) * st.similarity;
   // shifts under ~12% add artifacts without being audible, so skip them
@@ -376,19 +398,19 @@ function pickSystemVoice(voices, lang, male) {
   const pool = voices.filter(v => v.lang.toLowerCase().startsWith(lang));
   return pool.find(v => (male ? isMaleName(v.name) : FEMALE_RE.test(v.name))) || pool.find(v => v.localService) || pool[0] || null;
 }
-/** Browser speech synthesis shaped by a voice profile (pitch ratio) and the stability/similarity sliders. */
-function speakSource(text, voice, stability, similarity, sysName = '') {
+/** Browser speech synthesis shaped by a voice profile (pitch ratio), the stability/similarity sliders and the speed/pitch/volume controls. */
+function speakSource(text, voice, stability, similarity, sysName = '', ctl = {}) {
   const words = text.trim().split(/\s+/).length;
   return { duration: Math.max(1, words * .4), play(onEnd) {
     const synth = window.speechSynthesis; let off = false; synth.cancel();
-    const parts = text.match(/[^.!?।]+[.!?।]*/g) || [text], hi = voice.cat === 'Hindi', male = isMale(voice);
+    const plain = stripTags(text) || text, parts = plain.match(/[^.!?।]+[.!?।]*/g) || [plain], hi = voice.cat === 'Hindi', male = isMale(voice);
     const all = synth.getVoices(), chosen = sysName && all.find(v => v.name === sysName), sv = chosen || pickSystemVoice(all, hi ? 'hi' : 'en', male);
     if (!chosen && male && sv && !isMaleName(sv.name)) toast('No male system voice found – pick one under “Base voice”');
     const base = !sv ? 160 : chosen && !isMaleName(sv.name) && !FEMALE_RE.test(sv.name) ? (male ? 115 : 200) : isMaleName(sv.name) ? 115 : FEMALE_RE.test(sv.name) ? 200 : 160, ratio = clamp((voice.pitch || 150) / base, .3, 2.5);
     parts.forEach((p, i) => {
       const u = new SpeechSynthesisUtterance(p.trim()); if (sv) { u.voice = sv; u.lang = sv.lang; }
       const jitter = (Math.random() - .5) * (1 - stability) * .6;
-      u.pitch = clamp(1 + (ratio - 1) * similarity + jitter, .1, 2); u.rate = clamp(.8 + stability * .3, .6, 1.2);
+      u.pitch = clamp((1 + (ratio - 1) * similarity + jitter) * 2 ** ((ctl.pitch || 0) / 12), .1, 2); u.rate = clamp(ctl.speed ?? .8 + stability * .3, .5, 2); u.volume = clamp(ctl.volume ?? 1, 0, 1);
       if (i === parts.length - 1) { u.onend = u.onerror = () => { if (!off) onEnd(); }; }
       synth.speak(u);
     });
@@ -447,6 +469,35 @@ async function loadSample(blob, minSec) {
   let buf; try { buf = await decode(blob); } catch { toast('Could not read that audio file'); return null; }
   if (buf.duration < minSec) { toast(`Audio too short – need at least ${minSec}s`); return null; }
   return { blob, buf, dur: buf.duration };
+}
+
+/* ───────────── voice control settings ───────────── */
+const CONTROLS = {
+  stability: ['Stability', 0, 1, .05, v => v.toFixed(2), 'Higher is steadier, lower is more expressive'],
+  similarity: ['Similarity', 0, 1, .05, v => v.toFixed(2), 'How closely to match the chosen voice'],
+  style: ['Style', 0, 1, .05, v => v.toFixed(2), 'Extra expressiveness (ElevenLabs voices)'],
+  speed: ['Speed', .7, 1.2, .05, v => v.toFixed(2) + '×', ''],
+  pitch: ['Pitch', -6, 6, 1, v => (v > 0 ? '+' : '') + v + ' st', 'Semitones, applied to the finished audio'],
+  volume: ['Volume', 0, 1.5, .05, v => Math.round(v * 100) + '%', ''],
+};
+const saveVs = () => ls.set('voicesettings', S.vs);
+const settingsHtml = (keys, boost) => `<details class="vs" open><summary>Voice settings</summary>
+  ${keys.map(k => { const [label, min, max, step, show, hint] = CONTROLS[k];
+    return `<div class="slider" title="${esc(hint)}"><span>${label}</span><input type="range" data-vs="${k}" min="${min}" max="${max}" step="${step}" value="${S.vs[k]}" aria-label="${label}"><b data-vsv="${k}">${show(S.vs[k])}</b></div>`; }).join('')}
+  ${boost ? `<label class="check" style="margin:8px 0"><input type="checkbox" data-vs="boost" ${S.vs.boost ? 'checked' : ''}><span>Speaker boost <span class="muted">– closer to the original speaker (ElevenLabs)</span></span></label>` : ''}
+  <button type="button" class="btn ghost" data-vs-reset style="padding:10px;margin-top:6px">Reset to defaults</button></details>`;
+function bindSettings(r) {
+  const sync = () => $$('[data-vs]', r).forEach(i => { const k = i.dataset.vs; if (i.type === 'checkbox') i.checked = S.vs[k]; else { i.value = S.vs[k]; $(`[data-vsv="${k}"]`, r).textContent = CONTROLS[k][4](S.vs[k]); } });
+  $$('[data-vs]', r).forEach(i => i.oninput = i.onchange = () => { const k = i.dataset.vs; S.vs[k] = i.type === 'checkbox' ? i.checked : +i.value; if (CONTROLS[k]) $(`[data-vsv="${k}"]`, r).textContent = CONTROLS[k][4](S.vs[k]); saveVs(); });
+  const reset = $('[data-vs-reset]', r); if (reset) reset.onclick = () => { S.vs = { ...VS_DEFAULTS }; saveVs(); sync(); toast('Voice settings reset'); };
+}
+/** Applies the Pitch and Volume controls to finished audio. Returns a new AudioBuffer, or null when nothing changes. */
+function applyControls(buf, vs = S.vs) {
+  if (!vs.pitch && vs.volume === 1) return null;
+  let data = mono(buf);
+  if (vs.pitch) { const r = 2 ** (vs.pitch / 12); data = (psolaShift(buf, r) || pitchShift(buf, r)).data; }
+  if (vs.volume !== 1) { data = data.map(x => x * vs.volume); if (vs.volume > 1) data = data.map(x => Math.tanh(x)); }   // soft-limit boosts so they don't clip
+  const out = ac().createBuffer(1, data.length, buf.sampleRate); out.copyToChannel(data, 0); return out;
 }
 
 /* ───────────── views ───────────── */
@@ -673,11 +724,11 @@ V.tts = () => {
   return { html: `<section class="screen has-nav">${top('Text to Voice')}
     <label class="lbl" style="margin-top:0">Select Voice</label>${voiceDropdown('v', t.voiceId)}
     <label class="lbl">Base voice <span class="muted" style="font-weight:400">– the real voice your clone is built on</span></label>${baseVoiceDropdown('sys', t.sysVoice)}
-    <label class="lbl">Enter Text</label><textarea class="field" id="txt" maxlength="5000" placeholder="Type what the voice should say…">${esc(t.text)}</textarea>
-    <div class="muted" style="text-align:right"><span id="cnt">${t.text.length}</span>/5000</div>
-    <label class="lbl">Voice Settings</label>
-    <div class="slider"><span>Stability</span><input type="range" id="st" min="0" max="1" step=".05" value="${t.stability}"><b id="stv">${t.stability}</b></div>
-    <div class="slider"><span>Similarity</span><input type="range" id="si" min="0" max="1" step=".05" value="${t.similarity}"><b id="siv">${t.similarity}</b></div>
+    <label class="lbl">Enter Text</label>
+    <div class="tags" aria-label="Insert a tag">${TAG_GROUPS.map(([g, tags]) => `<div class="tag-row"><span class="muted">${g}</span>${tags.map(x => `<button type="button" class="tag" data-tag="${x}">${x}</button>`).join('')}</div>`).join('')}</div>
+    <textarea class="field" id="txt" maxlength="5000" placeholder="Type what the voice should say…">${esc(t.text)}</textarea>
+    <div class="muted" style="display:flex;justify-content:space-between;font-size:12px"><span>Tags are performed by ElevenLabs voices; other voices keep pauses and skip the rest.</span><span style="white-space:nowrap;margin-left:8px"><span id="cnt">${t.text.length}</span>/5000</span></div>
+    ${settingsHtml(['stability', 'similarity', 'style', 'speed', 'pitch', 'volume'], true)}
     <div class="grow"></div><button class="btn" id="gen">${icon('wave')} Generate Speech</button>${nav('tts')}</section>`,
   bind: r => {
     if (!('speechSynthesis' in window)) toast('Speech synthesis is not supported in this browser');
@@ -685,7 +736,14 @@ V.tts = () => {
     $('#sys', r).onchange = e => { t.sysVoice = e.target.value; ls.set('sysvoice', t.sysVoice); toast(t.sysVoice ? 'Base voice set' : 'Base voice: automatic'); };
     if (!speechSynthesis.getVoices().length) speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash === '#/tts') render(); }, { once: true });
     $('#txt', r).oninput = e => { t.text = e.target.value; $('#cnt', r).textContent = t.text.length; };
-    [['st', 'stability', 'stv'], ['si', 'similarity', 'siv']].forEach(([id, k, o]) => $('#' + id, r).oninput = e => { t[k] = +e.target.value; $('#' + o, r).textContent = t[k]; });
+    $$('[data-tag]', r).forEach(b => b.onclick = () => {
+      const ta = $('#txt', r), s = ta.selectionStart ?? ta.value.length, e = ta.selectionEnd ?? s, ins = `[${b.dataset.tag}]` + (/^\s/.test(ta.value.slice(e)) ? '' : ' ');
+      const pre = ta.value.slice(0, s), lead = pre && !/\s$/.test(pre) ? ' ' : '';
+      if ((ta.value.length - (e - s) + lead.length + ins.length) > 5000) return toast('Text is at the 5000 character limit');
+      ta.value = pre + lead + ins + ta.value.slice(e); const at = s + lead.length + ins.length; ta.focus(); ta.setSelectionRange(at, at);
+      ta.dispatchEvent(new Event('input'));
+    });
+    bindSettings(r);
     $('#gen', r).onclick = () => {
       if (!t.text.trim()) return toast('Enter some text first');
       const id = uid(); S.ttsResult = { text: t.text, voiceId: t.voiceId, id, fresh: true }; go('tts-result');
@@ -715,7 +773,7 @@ V['tts-result'] = () => {
       if (hostedId) {
         try {
           status('Generating with your cloned voice…', .3);
-          blob = await (await cloud.fn('tts', JSON.stringify({ voice_id: hostedId, text: res.text, stability: S.tts.stability, similarity: S.tts.similarity }))).blob();
+          blob = await (await cloud.fn('tts', JSON.stringify({ voice_id: hostedId, text: res.text, stability: S.vs.stability, similarity: S.vs.similarity, style: S.vs.style, speed: S.vs.speed, boost: S.vs.boost }))).blob();
           buf = await decode(blob);
         } catch (e) { if (cancelled) return; blob = null; toast(`Hosted voice unavailable (${String(e.message).slice(0, 60)}) – using the built-in voice`); }
       }
@@ -725,7 +783,7 @@ V['tts-result'] = () => {
         try {
           const out = await new Promise((resolve, reject) => {
             startDevice = () => resolve(null);
-            neuralSpeech(res.text, v, S.tts, status, () => cancelled || device).then(resolve, reject);
+            neuralSpeech(res.text, v, { ...S.tts, ...S.vs }, status, () => cancelled || device).then(resolve, reject);
           });
           if (out) { buf = ac().createBuffer(1, out.data.length, out.sr); buf.copyToChannel(out.data, 0); blob = encodeWav(out.data, out.sr); }
         } catch (e) { if (cancelled) return; console.warn('[neural tts]', e); device = true; toast(`Neural voice unavailable (${String(e.message || e).slice(0, 60)}) – using the device voice`); }
@@ -734,7 +792,8 @@ V['tts-result'] = () => {
     }
     clearInterval(tick);
     if (gone()) return;
-    const src = device ? speakSource(res.text, v, S.tts.stability, S.tts.similarity, S.tts.sysVoice.startsWith('k:') ? '' : S.tts.sysVoice) : bufferSource(buf);
+    if (buf && !res.buf) { const c = applyControls(buf); if (c) { buf = c; blob = encodeWav(mono(c), c.sampleRate); } }
+    const src = device ? speakSource(res.text, v, S.vs.stability, S.vs.similarity, S.tts.sysVoice.startsWith('k:') ? '' : S.tts.sysVoice, S.vs) : bufferSource(buf);
     body.innerHTML = `<div class="player">${playerHtml(device ? fakePeaks(res.text.length) : peaks(buf), src.duration, true)}</div>
       <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${hindiEl && buf ? ` (ElevenLabs ${esc(hindiEl.name.split(' - ')[0])})` : ''}${device ? ' (device voice)' : ''}</p>
       <div class="actions"><button class="act" id="dl" ${device ? 'disabled' : ''}>${icon('download')}Download</button>
@@ -756,6 +815,7 @@ V.v2v = () => {
   return { html: `<section class="screen has-nav">${top('Voice to Voice')}${captureHtml('Upload or Record Audio', 120)}
     <div id="chosen">${st.sample ? chosenHtml(st.sample) : ''}</div>
     <label class="lbl">Target Voice</label>${voiceDropdown('v', st.voiceId)}
+    <div class="gap"></div>${settingsHtml(['stability', 'similarity', 'style', 'pitch', 'volume'], true)}
     <div class="grow"></div><div class="gap"></div><button class="btn" id="conv" ${st.sample ? '' : 'disabled'}>${icon('wave')} Convert Audio</button>${nav('v2v')}</section>`,
   bind: r => {
     const show = () => { $('#chosen', r).innerHTML = chosenHtml(st.sample); $('#conv', r).disabled = false; const halt = bindPlayer($('.filechip', r), async () => bufferSource(st.sample.buf));
@@ -763,13 +823,14 @@ V.v2v = () => {
     if (st.sample) show();
     const stopRec = bindCapture(r, async (blob, rec) => { const s = await loadSample(blob, 1); if (s) { s.rec = rec; st.sample = s; show(); } }, 120);
     $('#v', r).onchange = e => { st.voiceId = e.target.value; };
+    bindSettings(r);
     $('#conv', r).onclick = async () => {
       const btn = $('#conv', r), voice = findVoice(st.voiceId); btn.disabled = true; btn.textContent = 'Converting…'; stopRec(); await sleep(30);
       try {
         let out, blob;
         if (voice.remote && cloud.hosted) {
           try {
-            const f = new FormData(); f.set('voice_id', voice.remote); f.set('audio', wavForUpload(st.sample.buf, 120), 'input.wav'); f.set('stability', S.tts.stability); f.set('similarity', S.tts.similarity);
+            const f = new FormData(); f.set('voice_id', voice.remote); f.set('audio', wavForUpload(st.sample.buf, 120), 'input.wav'); f.set('stability', S.vs.stability); f.set('similarity', S.vs.similarity); f.set('style', S.vs.style); f.set('boost', S.vs.boost);
             blob = await (await cloud.fn('sts', f)).blob(); out = await decode(blob);
           } catch (e) { blob = out = null; toast(`Hosted conversion unavailable (${String(e.message).slice(0, 60)}) – using the built-in converter`); }
         }
@@ -778,6 +839,7 @@ V.v2v = () => {
           const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, shifted = psolaShift(st.sample.buf, ratio) || pitchShift(st.sample.buf, ratio), sr = shifted.sr, data = applyFx(shifted.data, sr, voice.fx);
           out = ac().createBuffer(1, data.length, sr); out.copyToChannel(data, 0); blob = encodeWav(data, sr);
         }
+        const c = applyControls(out); if (c) { out = c; blob = encodeWav(mono(c), c.sampleRate); }
         const id = uid(); await blobs.put('audio:' + id, blob);
         S.v2vResult = { id, original: st.sample.buf, converted: out, blob, voice: voice.name };
         const item = { id, kind: 'v2v', title: `Converted to ${voice.name}`, ts: Date.now(), dur: out.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); go('v2v-result');

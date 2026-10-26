@@ -124,10 +124,12 @@ const S = {
 };
 const allVoices = () => [...S.voices, ...S.elVoices, ...PRESETS];
 const LANGS = { hi: 'Hindi', en: 'English', kn: 'Kannada', ta: 'Tamil', te: 'Telugu', mr: 'Marathi', bn: 'Bengali', pt: 'Portuguese', de: 'German', nl: 'Dutch', it: 'Italian', tr: 'Turkish' };
-/** Best ElevenLabs Hindi voice for a gender (skips character/kids voices); undefined if none. */
+/** Best ElevenLabs voice for Hindi speech of a gender (skips character/kids voices); undefined if none. */
 const hindiElVoice = male => {
-  const pool = S.elVoices.filter(v => v.lang === 'hi' && v.gender === (male ? 'male' : 'female'));
-  return pool.find(v => !/kids|character|story/i.test(v.name)) || pool[0];
+  const g = male ? 'male' : 'female', calm = v => !/kids|character|story|trickster|warrior|quirky/i.test(v.name);
+  // Native Hindi voices first; otherwise any voice of that gender (the multilingual model speaks Hindi with it).
+  const hi = S.elVoices.filter(v => v.lang === 'hi' && v.gender === g), any = S.elVoices.filter(v => v.gender === g);
+  return hi.find(calm) || hi[0] || any.find(calm) || any[0];
 };
 /** Fetch the ElevenLabs account's own voices through voice-api; re-render screens that list voices. */
 async function loadElVoices() {

@@ -67,6 +67,37 @@ const cloud = (() => {
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `request failed (${r.status})`);
       return r;
     },
+    /**
+     * Same request as fn(), returning the response Blob and reporting real progress:
+     * onEvt('upload', fraction) while sending, onEvt('wait') once sent, onEvt('download', fraction|null, bytes) while receiving.
+     * ctl.abort() cancels.
+     */
+    async fnBlob(path, body, onEvt = () => {}, ctl = {}) {
+      const { data } = await sb.auth.getSession(), token = data.session?.access_token;
+      if (!token) throw new Error('sign in required');
+      return new Promise((resolve, reject) => {
+        const x = new XMLHttpRequest(); ctl.abort = () => x.abort();
+        x.open('POST', `${cfg.SUPABASE_URL}/functions/v1/voice-api/${path}`); x.responseType = 'blob';
+        x.setRequestHeader('authorization', `Bearer ${token}`); x.setRequestHeader('apikey', cfg.SUPABASE_KEY);
+        // 'wait' fires once, when the body is fully sent; the fallbacks cover browsers that report no upload progress.
+        let sent = false, uploading = false; const markSent = () => { if (!sent) { sent = true; onEvt('wait'); } };
+        if (typeof body === 'string') x.setRequestHeader('content-type', 'application/json');
+        else {
+          x.upload.onprogress = e => { if (!e.lengthComputable) return; uploading = true; onEvt('upload', e.loaded / e.total); if (e.loaded >= e.total) markSent(); };
+          x.upload.onloadend = markSent;
+          setTimeout(() => { if (!uploading) markSent(); }, 1200);
+        }
+        x.onreadystatechange = () => { if (x.readyState >= 2) markSent(); };
+        x.onprogress = e => onEvt('download', e.lengthComputable ? e.loaded / e.total : null, e.loaded);
+        x.onload = async () => {
+          if (x.status >= 200 && x.status < 300) return resolve(x.response);
+          let msg = `request failed (${x.status})`; try { msg = JSON.parse(await x.response.text()).error || msg; } catch { /* keep default */ }
+          reject(new Error(msg));
+        };
+        x.onerror = () => reject(new Error('network error')); x.onabort = () => reject(new Error('cancelled'));
+        x.send(body); if (typeof body === 'string') markSent();
+      });
+    },
     async session() { const { data } = await sb.auth.getSession(); const u = data.session?.user || null; uid_ = u?.id || null; return u; },
     async auth(mode, email, password) {
       const { data, error } = mode === 'up' ? await sb.auth.signUp({ email, password }) : await sb.auth.signInWithPassword({ email, password });
@@ -445,6 +476,44 @@ function applyControls(buf, vs = S.vs) {
   const out = ac().createBuffer(1, data.length, buf.sampleRate); out.copyToChannel(data, 0); return out;
 }
 
+/* ───────────── progress loader ───────────── */
+/**
+ * Ring loader with a percentage, a running mm:ss timer and a stage label, rendered into `el`.
+ * set() only moves forward; creep() eases toward a ceiling while waiting on a step with no progress signal.
+ */
+function progressLoader(el) {
+  el.innerHTML = `<div class="ring pl" style="--v:0"><div class="ring-in"><b class="pl-pct">0%</b><span class="pl-time">00:00</span></div></div><p class="center pl-stage">Preparing…</p>`;
+  const ring = $('.pl', el), pctEl = $('.pl-pct', el), timeEl = $('.pl-time', el), stageEl = $('.pl-stage', el), t0 = performance.now();
+  let pct = 0, shown = 0, creep = null;
+  const draw = () => { ring.style.setProperty('--v', shown); pctEl.textContent = Math.floor(shown) + '%'; timeEl.textContent = fmt(Math.floor((performance.now() - t0) / 1000)); };
+  const iv = setInterval(() => {
+    if (!el.isConnected) return clearInterval(iv);
+    if (creep) pct = Math.max(pct, creep.from + (creep.to - creep.from) * (1 - Math.exp(-(performance.now() - creep.t0) / 1000 / creep.tau)));
+    shown += (pct - shown) * .35; if (pct - shown < .3) shown = pct; draw();
+  }, 100);
+  return {
+    /** `snap` shows the value at once – used before blocking work, when the animation can't run. */
+    set(p, stage, snap) { pct = Math.max(pct, Math.min(100, p)); if (stage) stageEl.textContent = stage; if (snap) { shown = pct; draw(); } },
+    creep(from, to, tau, stage) { creep = { from, to, tau, t0: performance.now() }; this.set(from, stage); },
+    endCreep() { creep = null; },
+    done(stage = 'Done') { creep = null; pct = shown = 100; stageEl.textContent = stage; draw(); clearInterval(iv); },
+    stop() { clearInterval(iv); },
+  };
+}
+/**
+ * Runs a voice-api request inside a loader: upload 5–35% and download 80–97% are measured from real bytes; the provider's
+ * processing time in between has no progress signal, so it eases toward 80% based on the expected audio length.
+ */
+function hostedWithProgress(pl, path, body, expectSec, ctl, waitLabel) {
+  const expectBytes = Math.max(8000, expectSec * 16000);   // 128 kbps MP3
+  pl.set(5, 'Uploading…');
+  return cloud.fnBlob(path, body, (k, f, bytes) => {
+    if (k === 'upload') pl.set(5 + 30 * f, 'Uploading…');
+    else if (k === 'wait') pl.creep(35, 80, Math.max(2, expectSec * .4), waitLabel);
+    else if (k === 'download') { pl.endCreep(); pl.set(80 + 17 * Math.min(1, f ?? bytes / expectBytes), 'Receiving audio…'); }
+  }, ctl);
+}
+
 /* ───────────── views ───────────── */
 const nav = on => `<nav class="bottom">
   ${[['home', 'home', 'Home'], ['tts', 'text', 'Generate']].map(([r, ic, l]) => `<button data-go="${r}" class="${on === r ? 'on' : ''}">${icon(ic)}${l}</button>`).join('')}
@@ -698,32 +767,31 @@ V.tts = () => {
 V['tts-result'] = () => {
   const res = S.ttsResult, v = res && findVoice(res.voiceId);
   if (!v) return { html: '', bind: () => go('tts') };
-  return { html: `<section class="screen">${top('Generated Audio')}<div id="body"><div class="player center"><div class="muted" id="status">Preparing…</div>
-    <div class="bar"><i id="barfill"></i></div><div class="muted" id="elapsed" style="margin-top:8px;font-size:12px"></div></div>
+  return { html: `<section class="screen">${top('Generated Audio')}<div id="body"><div id="loader"></div>
     <div class="gap"></div><button class="btn ghost" id="cancel">Cancel</button></div></section>`,
   bind: async r => {
     const body = $('#body', r), gone = () => !r.isConnected;
     let cancelled = false, device = false, buf = res.buf, blob = res.blob, standIn = null;
-    const t0 = Date.now(), tick = setInterval(() => { if (gone()) return clearInterval(tick); $('#elapsed', r).textContent = `${Math.round((Date.now() - t0) / 1000)} s`; }, 500);
-    const status = (t, f) => { if (gone()) return; $('#status', r).textContent = t; if (f != null) $('#barfill', r).style.width = Math.round(f * 100) + '%'; };
+    const pl = progressLoader($('#loader', r)), ctl = {};
     if (!buf) {
-      $('#cancel', r).onclick = () => { cancelled = true; go('tts'); };
+      $('#cancel', r).onclick = () => { cancelled = true; ctl.abort?.(); go('tts'); };
       // Voices without their own ElevenLabs voice speak through an ElevenLabs voice of the same gender
       standIn = !v.remote && cloud.hosted ? elVoiceFor(isMale(v), v.cat === 'Hindi' || /[\u0900-\u097F]/.test(res.text)) : null;
       const hostedId = v.remote || standIn?.remote;
       if (hostedId) {
         try {
-          status('Generating speech…', .3);
-          blob = await (await cloud.fn('tts', JSON.stringify({ voice_id: hostedId, text: res.text, stability: S.vs.stability, similarity: S.vs.similarity, style: S.vs.style, speed: S.vs.speed, boost: S.vs.boost }))).blob();
-          buf = await decode(blob);
-          if (standIn) { const s = shapeToVoice(buf, v, S.vs.similarity); if (s) { buf = s; blob = encodeWav(mono(s), s.sampleRate); } }
+          const words = stripTags(res.text).split(/\s+/).filter(Boolean).length, expectSec = Math.max(2, words * .4 / (S.vs.speed || 1));
+          blob = await hostedWithProgress(pl, 'tts', JSON.stringify({ voice_id: hostedId, text: res.text, stability: S.vs.stability, similarity: S.vs.similarity, style: S.vs.style, speed: S.vs.speed, boost: S.vs.boost }), expectSec, ctl, 'Generating with ElevenLabs…');
+          pl.set(97, 'Decoding…'); buf = await decode(blob);
+          if (standIn) { pl.set(97, 'Matching the voice…'); await sleep(20); const s = shapeToVoice(buf, v, S.vs.similarity); if (s) { buf = s; blob = encodeWav(mono(s), s.sampleRate); } }
         } catch (e) { if (cancelled) return; buf = blob = null; toast(`ElevenLabs unavailable (${String(e.message).slice(0, 60)}) – using the device voice`); }
       }
       if (!buf) device = true;
     }
-    clearInterval(tick);
     if (gone()) return;
-    if (buf && !res.buf) { const c = applyControls(buf); if (c) { buf = c; blob = encodeWav(mono(c), c.sampleRate); } }
+    if (buf && !res.buf) { pl.set(98, 'Applying settings…'); await sleep(20); const c = applyControls(buf); if (c) { buf = c; blob = encodeWav(mono(c), c.sampleRate); } }
+    if (buf && !res.buf) { pl.done(); await sleep(350); } else pl.stop();
+    if (gone()) return;
     const src = device ? speakSource(res.text, v, S.vs.stability, S.vs.similarity, S.tts.sysVoice, S.vs) : bufferSource(buf);
     body.innerHTML = `<div class="player">${playerHtml(device ? fakePeaks(res.text.length) : peaks(buf), src.duration, true)}</div>
       <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${standIn && buf ? ` (ElevenLabs ${esc(standIn.name.split(' - ')[0])})` : ''}${device ? ' (device voice)' : ''}</p>
@@ -747,6 +815,8 @@ V.v2v = () => {
     <div id="chosen">${st.sample ? chosenHtml(st.sample) : ''}</div>
     <label class="lbl">Target Voice</label>${voiceDropdown('v', st.voiceId)}
     <div class="gap"></div>${settingsHtml(['stability', 'similarity', 'style', 'pitch', 'volume'], true)}
+    <div class="overlay" id="conv-ov" hidden><div class="ov-card" role="dialog" aria-label="Converting audio"><h3 class="center">Converting audio</h3><div id="conv-pl"></div>
+      <button class="btn ghost" id="conv-cancel">Cancel</button></div></div>
     <div class="grow"></div><div class="gap"></div><button class="btn" id="conv" ${st.sample ? '' : 'disabled'}>${icon('wave')} Convert Audio</button>${nav('v2v')}</section>`,
   bind: r => {
     const show = () => { $('#chosen', r).innerHTML = chosenHtml(st.sample); $('#conv', r).disabled = false; const halt = bindPlayer($('.filechip', r), async () => bufferSource(st.sample.buf));
@@ -756,25 +826,37 @@ V.v2v = () => {
     $('#v', r).onchange = e => { st.voiceId = e.target.value; };
     bindSettings(r);
     $('#conv', r).onclick = async () => {
-      const btn = $('#conv', r), voice = findVoice(st.voiceId); btn.disabled = true; btn.textContent = 'Converting…'; stopRec(); await sleep(30);
+      const btn = $('#conv', r), voice = findVoice(st.voiceId), ov = $('#conv-ov', r), ctl = {}; let cancelled = false;
+      btn.disabled = true; stopRec(); ov.hidden = false;
+      const pl = progressLoader($('#conv-pl', r)), step = async (p, label) => { pl.set(p, label, true); await sleep(50); if (cancelled) throw new Error('cancelled'); };
+      const restore = () => { pl.stop(); ov.hidden = true; btn.disabled = false; };
+      $('#conv-cancel', r).onclick = () => { cancelled = true; ctl.abort?.(); restore(); toast('Conversion cancelled'); };
       try {
         let out, blob;
         if (voice.remote && cloud.hosted) {
           try {
+            await step(2, 'Preparing audio…');
             const f = new FormData(); f.set('voice_id', voice.remote); f.set('audio', wavForUpload(st.sample.buf, 120), 'input.wav'); f.set('stability', S.vs.stability); f.set('similarity', S.vs.similarity); f.set('style', S.vs.style); f.set('boost', S.vs.boost);
-            blob = await (await cloud.fn('sts', f)).blob(); out = await decode(blob);
-          } catch (e) { blob = out = null; toast(`Hosted conversion unavailable (${String(e.message).slice(0, 60)}) – using the built-in converter`); }
+            blob = await hostedWithProgress(pl, 'sts', f, Math.min(120, st.sample.dur), ctl, 'Converting on ElevenLabs…');
+            await step(97, 'Decoding…'); out = await decode(blob);
+          } catch (e) { if (cancelled) throw e; blob = out = null; toast(`Hosted conversion unavailable (${String(e.message).slice(0, 60)}) – using the built-in converter`); }
         }
         if (!out) {
+          await step(5, 'Analysing your voice…');
           const srcPitch = detectPitch(st.sample.buf); if (!srcPitch) toast('Couldn’t detect the pitch of your audio – converting at neutral');
-          const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, shifted = psolaShift(st.sample.buf, ratio) || pitchShift(st.sample.buf, ratio), sr = shifted.sr, data = applyFx(shifted.data, sr, voice.fx);
+          await step(30, 'Shifting the voice…');
+          const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, shifted = psolaShift(st.sample.buf, ratio) || pitchShift(st.sample.buf, ratio);
+          await step(85, voice.fx ? 'Applying effect…' : 'Finishing…');
+          const sr = shifted.sr, data = applyFx(shifted.data, sr, voice.fx);
           out = ac().createBuffer(1, data.length, sr); out.copyToChannel(data, 0); blob = encodeWav(data, sr);
         }
+        await step(98, 'Applying settings…');
         const c = applyControls(out); if (c) { out = c; blob = encodeWav(mono(c), c.sampleRate); }
         const id = uid(); await blobs.put('audio:' + id, blob);
+        pl.done(); await sleep(350); if (cancelled) return;
         S.v2vResult = { id, original: st.sample.buf, converted: out, blob, voice: voice.name };
         const item = { id, kind: 'v2v', title: `Converted to ${voice.name}`, ts: Date.now(), dur: out.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); go('v2v-result');
-      } catch (e) { console.error(e); toast('Conversion failed'); btn.disabled = false; btn.textContent = 'Convert Audio'; }
+      } catch (e) { if (cancelled) return; console.error(e); toast('Conversion failed'); restore(); }
     };
   } };
 };

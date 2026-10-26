@@ -45,13 +45,15 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
     return Array.isArray(rows) && rows.length > 0;
   };
   // Voices in the ElevenLabs account itself (premade + saved library voices) may be used by any signed-in user.
+  // Free plans can't use library voices through the API (402), so on a free plan only premade voices are offered.
   let accountVoices: { voice_id: string; name: string; category: string; labels: Record<string, string>; preview_url: string }[] | null = null;
   const listAccountVoices = async () => {
     if (accountVoices) return accountVoices;
     const r = await f(`${EL}/voices`, { headers: xi });
     if (!r.ok) { console.error('[voice-api] voice list failed', r.status); return []; }
-    const b = await r.json();
-    return accountVoices = (b.voices ?? []).filter((v: { category?: string }) => v.category !== 'cloned');
+    const b = await r.json(), sub = await f(`${EL}/user/subscription`, { headers: xi });
+    const tier = sub.ok ? String((await sub.json()).tier ?? '') : '';
+    return accountVoices = (b.voices ?? []).filter((v: { category?: string }) => v.category !== 'cloned' && (tier !== 'free' || v.category === 'premade'));
   };
   const usable = async (id: string) => VOICE_ID.test(id) && ((await owns(id)) || (await listAccountVoices()).some(v => v.voice_id === id));
   const settings = (stability: unknown, similarity: unknown) => ({ stability: clamp01(stability, .5), similarity_boost: clamp01(similarity, .75) });

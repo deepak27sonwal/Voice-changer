@@ -69,7 +69,7 @@ const cloud = (() => {
       if (v.error || r.error) return null;
       return { voices: v.data.map(({ user_id, ...x }) => x), recents: r.data.map(({ user_id, voice_id, ...x }) => ({ ...x, voiceId: voice_id })) };
     },
-    upsertVoice: v => on && uid_ && safe(() => sb.from('voices').upsert({ id: v.id, name: v.name, cat: v.cat, pitch: v.pitch, dur: v.dur, created: v.created }, { onConflict: 'user_id,id' })),
+    upsertVoice: v => on && uid_ && safe(() => sb.from('voices').upsert({ id: v.id, name: v.name, cat: v.cat, pitch: v.pitch, gender: v.gender ?? null, dur: v.dur, created: v.created }, { onConflict: 'user_id,id' })),
     deleteVoice: id => on && uid_ && safe(() => sb.from('voices').delete().eq('id', id)),
     upsertRecent: a => on && uid_ && safe(() => sb.from('recents').upsert({ id: a.id, kind: a.kind, title: a.title, text: a.text ?? null, voice_id: a.voiceId ?? null, ts: a.ts, dur: a.dur }, { onConflict: 'user_id,id' })),
     deleteRecent: id => on && uid_ && safe(() => sb.from('recents').delete().eq('id', id)),
@@ -108,7 +108,7 @@ const S = {
   recents: ls.get('recents', []),
   draft: null,                  // voice being created: { blob, buf, dur }
   consent: false,
-  tts: { voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.', stability: .7, similarity: .8 },
+  tts: { sysVoice: ls.get('sysvoice', ''), voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.', stability: .7, similarity: .8 },
   ttsResult: null, v2v: { sample: null, voiceId: null }, v2vResult: null,
   libTab: 'mine', libQuery: '', stopPlayback: null,
 };
@@ -269,13 +269,14 @@ function pickSystemVoice(voices, lang, male) {
   return pool.find(v => (male ? isMaleName(v.name) : FEMALE_RE.test(v.name))) || pool.find(v => v.localService) || pool[0] || null;
 }
 /** Browser speech synthesis shaped by a voice profile (pitch ratio) and the stability/similarity sliders. */
-function speakSource(text, voice, stability, similarity) {
+function speakSource(text, voice, stability, similarity, sysName = '') {
   const words = text.trim().split(/\s+/).length;
   return { duration: Math.max(1, words * .4), play(onEnd) {
     const synth = window.speechSynthesis; let off = false; synth.cancel();
     const parts = text.match(/[^.!?।]+[.!?।]*/g) || [text], hi = voice.cat === 'Hindi', male = isMale(voice);
-    const sv = pickSystemVoice(synth.getVoices(), hi ? 'hi' : 'en', male);
-    const base = sv ? (isMaleName(sv.name) ? 115 : 200) : 160, ratio = clamp((voice.pitch || 150) / base, .3, 2.5);
+    const all = synth.getVoices(), chosen = sysName && all.find(v => v.name === sysName), sv = chosen || pickSystemVoice(all, hi ? 'hi' : 'en', male);
+    if (!chosen && male && sv && !isMaleName(sv.name)) toast('No male system voice found – pick one under “Base voice”');
+    const base = !sv ? 160 : chosen && !isMaleName(sv.name) && !FEMALE_RE.test(sv.name) ? (male ? 115 : 200) : isMaleName(sv.name) ? 115 : FEMALE_RE.test(sv.name) ? 200 : 160, ratio = clamp((voice.pitch || 150) / base, .3, 2.5);
     parts.forEach((p, i) => {
       const u = new SpeechSynthesisUtterance(p.trim()); if (sv) { u.voice = sv; u.lang = sv.lang; }
       const jitter = (Math.random() - .5) * (1 - stability) * .6;
@@ -371,6 +372,11 @@ function bindDropdowns(root) {
   });
 }
 document.addEventListener('click', e => { if (!e.target.closest('.dd')) $$('.dd-list').forEach(l => { l.hidden = true; }); });
+const baseVoiceDropdown = (id, sel) => {
+  const items = (window.speechSynthesis?.getVoices() || []).filter(v => /^(en|hi)/i.test(v.lang))
+    .map(v => ({ value: v.name, label: v.name, sub: `${v.lang} • ${isMaleName(v.name) ? 'male' : FEMALE_RE.test(v.name) ? 'female' : 'unknown'}` }));
+  return ddHtml(id, [{ items: [{ value: '', label: 'Automatic', sub: 'match the voice’s male/female type' }, ...items] }], sel);
+};
 const voiceItem = v => ({ value: v.id, label: v.name, sub: `${v.cat}${v.pitch ? ` • ${v.pitch} Hz` : ''}${v.fx ? ` • ${v.fx}` : ''}` });
 const voiceDropdown = (id, sel) => ddHtml(id, [...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(voiceItem) }] : []), { title: 'Preset voices', items: PRESETS.map(voiceItem) }], sel);
 const go = r => { location.hash = '#/' + r; };
@@ -498,7 +504,8 @@ V.created = () => ({
     <div class="center"><h2>Your voice is ready!</h2><p class="muted">Give a name to your voice and choose a category.</p></div>
     <div class="gap"></div><input class="field" id="name" value="${esc((S.user?.name || 'My') + ' Voice')}" maxlength="40">
     <div class="gap"></div>${ddHtml('cat', [{ items: CATEGORIES.map(c => ({ value: c, label: c })) }], 'Personal')}
-    <p class="muted" style="margin-top:10px">Detected pitch: ${S.draft?.pitch ? S.draft.pitch + ' Hz' : 'unknown (default will be used)'}</p>
+    <label class="lbl">Voice type</label>${ddHtml('gender', [{ items: [{ value: 'auto', label: 'Automatic', sub: S.draft?.pitch ? `detected ${S.draft.pitch} Hz → ${S.draft.pitch < 165 ? 'male' : 'female'}` : 'pitch not detected' }, { value: 'male', label: 'Male' }, { value: 'female', label: 'Female' }] }], 'auto')}
+    <p class="muted" style="margin-top:10px">Detected pitch: ${S.draft?.pitch ? S.draft.pitch + ' Hz' : 'unknown (default will be used)'}. Choose the type yourself if the guess is wrong.</p>
     <div class="grow"></div><div class="gap"></div><button class="btn" id="save">Save Voice</button><div class="gap"></div>
     <div class="btn ghost" style="padding:0" id="pl"><div style="width:100%;padding:10px 14px">${playerHtml(S.draft ? peaks(S.draft.buf, 24) : fakePeaks(3, 24), S.draft?.dur || 0)}</div></div></section>`,
   bind: r => {
@@ -506,7 +513,7 @@ V.created = () => ({
     bindPlayer($('#pl', r), async () => bufferSource(d.buf));
     $('#save', r).onclick = () => {
       const name = $('#name', r).value.trim(); if (!name) return toast('Please enter a name');
-      const v = { id: d.tmpId, name, cat: $('#cat', r).value, pitch: d.pitch || 150, dur: d.dur, created: Date.now() };
+      const g = $('#gender', r).value, pitch = d.pitch || 150, v = { id: d.tmpId, name, cat: $('#cat', r).value, pitch, gender: g === 'auto' ? (pitch < 165 ? 'male' : 'female') : g, dur: d.dur, created: Date.now() };
       S.voices.unshift(v); saveVoices(); cloud.upsertVoice(v); cloud.putBlob('sample:' + v.id, d.blob); S.draft = null; toast('Voice saved'); go('library');
     };
   } });
@@ -544,6 +551,7 @@ V.tts = () => {
   const t = S.tts; t.voiceId = findVoice(t.voiceId) ? t.voiceId : allVoices()[0].id;
   return { html: `<section class="screen has-nav">${top('Text to Voice')}
     <label class="lbl" style="margin-top:0">Select Voice</label>${voiceDropdown('v', t.voiceId)}
+    <label class="lbl">Base voice <span class="muted" style="font-weight:400">– the device voice your clone is built on</span></label>${baseVoiceDropdown('sys', t.sysVoice)}
     <label class="lbl">Enter Text</label><textarea class="field" id="txt" maxlength="5000" placeholder="Type what the voice should say…">${esc(t.text)}</textarea>
     <div class="muted" style="text-align:right"><span id="cnt">${t.text.length}</span>/5000</div>
     <label class="lbl">Voice Settings</label>
@@ -553,6 +561,8 @@ V.tts = () => {
   bind: r => {
     if (!('speechSynthesis' in window)) toast('Speech synthesis is not supported in this browser');
     $('#v', r).onchange = e => { t.voiceId = e.target.value; };
+    $('#sys', r).onchange = e => { t.sysVoice = e.target.value; ls.set('sysvoice', t.sysVoice); toast(t.sysVoice ? 'Base voice set' : 'Base voice: automatic'); };
+    if (!speechSynthesis.getVoices().length) speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash === '#/tts') render(); }, { once: true });
     $('#txt', r).oninput = e => { t.text = e.target.value; $('#cnt', r).textContent = t.text.length; };
     [['st', 'stability', 'stv'], ['si', 'similarity', 'siv']].forEach(([id, k, o]) => $('#' + id, r).oninput = e => { t[k] = +e.target.value; $('#' + o, r).textContent = t[k]; });
     $('#gen', r).onclick = () => {
@@ -565,7 +575,7 @@ V.tts = () => {
 V['tts-result'] = () => {
   const res = S.ttsResult, v = res && findVoice(res.voiceId);
   if (!v) return { html: '', bind: () => go('tts') };
-  const src = speakSource(res.text, v, S.tts.stability, S.tts.similarity);
+  const src = speakSource(res.text, v, S.tts.stability, S.tts.similarity, S.tts.sysVoice);
   return { html: `<section class="screen">${top('Generated Audio')}<div class="player">${playerHtml(fakePeaks(res.text.length), src.duration, true)}</div>
     <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}</p>
     <div class="actions"><button class="act" id="dl" disabled title="Browser speech can’t be exported">${icon('download')}Download</button>

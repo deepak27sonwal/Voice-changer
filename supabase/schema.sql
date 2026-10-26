@@ -7,10 +7,14 @@ create table if not exists public.voices (
   name    text not null,
   cat     text not null default 'Personal',
   pitch   integer not null default 150,
+  gender  text check (gender in ('male', 'female')),
   dur     real not null default 0,
   created bigint not null,
   primary key (user_id, id)
 );
+
+-- For projects created before the gender column existed:
+alter table public.voices add column if not exists gender text check (gender in ('male', 'female'));
 
 create table if not exists public.recents (
   user_id  uuid not null default auth.uid() references auth.users(id) on delete cascade,

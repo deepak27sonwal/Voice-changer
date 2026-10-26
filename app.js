@@ -86,20 +86,20 @@ const blobs = {
 };
 
 const PRESETS = [
-  { id: 'pre-narrator', name: 'Female Narrator', cat: 'English', pitch: 210, dur: 60, preset: true },
-  { id: 'pre-anchor', name: 'News Anchor', cat: 'Hindi', pitch: 115, dur: 60, preset: true },
-  { id: 'pre-char', name: 'Character 1', cat: 'Custom', pitch: 290, dur: 180, preset: true },
-  { id: 'pre-deep', name: 'Deep Voice', cat: 'English', pitch: 85, dur: 90, preset: true },
-  { id: 'pre-man', name: 'Young Man', cat: 'Male', pitch: 125, dur: 60, preset: true },
-  { id: 'pre-elder', name: 'Elderly Man', cat: 'Male', pitch: 100, dur: 60, preset: true },
-  { id: 'pre-woman', name: 'Soft Woman', cat: 'Female', pitch: 235, dur: 60, preset: true },
-  { id: 'pre-grand', name: 'Elderly Woman', cat: 'Female', pitch: 195, dur: 60, preset: true },
-  { id: 'pre-child', name: 'Child', cat: 'Character', pitch: 330, dur: 60, preset: true },
-  { id: 'pre-monster', name: 'Monster', cat: 'Character', pitch: 60, dur: 60, preset: true },
-  { id: 'pre-chip', name: 'Chipmunk', cat: 'Effects', pitch: 400, dur: 60, preset: true },
-  { id: 'pre-robot', name: 'Robot', cat: 'Effects', pitch: 140, fx: 'robot', dur: 60, preset: true },
-  { id: 'pre-alien', name: 'Alien', cat: 'Effects', pitch: 300, fx: 'robot', dur: 60, preset: true },
-  { id: 'pre-whisper', name: 'Whisper', cat: 'Effects', pitch: 160, fx: 'whisper', dur: 60, preset: true },
+  { id: 'pre-narrator', gender: 'female', name: 'Female Narrator', cat: 'English', pitch: 210, dur: 60, preset: true },
+  { id: 'pre-anchor', gender: 'male', name: 'News Anchor', cat: 'Hindi', pitch: 115, dur: 60, preset: true },
+  { id: 'pre-char', gender: 'female', name: 'Character 1', cat: 'Custom', pitch: 290, dur: 180, preset: true },
+  { id: 'pre-deep', gender: 'male', name: 'Deep Voice', cat: 'English', pitch: 85, dur: 90, preset: true },
+  { id: 'pre-man', gender: 'male', name: 'Young Man', cat: 'Male', pitch: 125, dur: 60, preset: true },
+  { id: 'pre-elder', gender: 'male', name: 'Elderly Man', cat: 'Male', pitch: 100, dur: 60, preset: true },
+  { id: 'pre-woman', gender: 'female', name: 'Soft Woman', cat: 'Female', pitch: 235, dur: 60, preset: true },
+  { id: 'pre-grand', gender: 'female', name: 'Elderly Woman', cat: 'Female', pitch: 195, dur: 60, preset: true },
+  { id: 'pre-child', gender: 'female', name: 'Child', cat: 'Character', pitch: 330, dur: 60, preset: true },
+  { id: 'pre-monster', gender: 'male', name: 'Monster', cat: 'Character', pitch: 60, dur: 60, preset: true },
+  { id: 'pre-chip', gender: 'female', name: 'Chipmunk', cat: 'Effects', pitch: 400, dur: 60, preset: true },
+  { id: 'pre-robot', gender: 'male', name: 'Robot', cat: 'Effects', pitch: 140, fx: 'robot', dur: 60, preset: true },
+  { id: 'pre-alien', gender: 'female', name: 'Alien', cat: 'Effects', pitch: 300, fx: 'robot', dur: 60, preset: true },
+  { id: 'pre-whisper', gender: 'female', name: 'Whisper', cat: 'Effects', pitch: 160, fx: 'whisper', dur: 60, preset: true },
 ];
 const CATEGORIES = ['Personal', 'English', 'Hindi', 'Male', 'Female', 'Character', 'Effects', 'Custom'];
 const S = {
@@ -138,13 +138,64 @@ function detectPitch(buf) {
   const peak = frames[0].e, pitches = [];
   for (const { s, e } of frames.slice(0, 60)) {
     if (e < peak * .1) break;
-    let best = 0, bestLag = 0;
-    for (let lag = minLag; lag <= maxLag; lag++) { let r = 0; for (let i = 0; i < W; i++) r += d[s + i] * d[s + i + lag]; if (r / e > best) { best = r / e; bestLag = lag; } }
+    let best = 0, bestLag = 0; const rr = new Float32Array(maxLag + 1);
+    for (let lag = minLag; lag <= maxLag; lag++) { let r = 0; for (let i = 0; i < W; i++) r += d[s + i] * d[s + i + lag]; rr[lag] = r / e; if (rr[lag] > best) { best = rr[lag]; bestLag = lag; } }
+    for (let lag = minLag; bestLag && lag * 2 <= bestLag + 1; lag++) if (rr[lag] > best * .9 && Math.abs(lag * 2 - bestLag) <= 2) { bestLag = lag; break; }   // octave-down fix
     if (best > .5 && bestLag) pitches.push(rate / bestLag);
   }
   if (!pitches.length) return 0;
   pitches.sort((a, b) => a - b);
   return Math.round(pitches[pitches.length >> 1]);
+}
+
+/** Frame-wise f0 track (Hz, 0 = unvoiced) via autocorrelation. Returns { hop (samples at sr), f0 }. */
+function pitchTrack(x, sr) {
+  const f = Math.max(1, Math.round(sr / 11025)), n = Math.floor(x.length / f), d = new Float32Array(n), rate = sr / f;
+  for (let i = 0; i < n; i++) { let s = 0; for (let k = 0; k < f; k++) s += x[i * f + k]; d[i] = s / f; }
+  const W = Math.round(rate * .035), hop = Math.round(rate * .01), minLag = Math.floor(rate / 400), maxLag = Math.floor(rate / 70), f0 = [];
+  let peak = 0; for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(d[i]));
+  for (let s = 0; s + W + maxLag < n; s += hop) {
+    let e = 0; for (let i = 0; i < W; i++) e += d[s + i] * d[s + i];
+    if (e / W < (peak * .03) ** 2) { f0.push(0); continue; }
+    const r = new Float32Array(maxLag + 1); let best = 0, bl = 0;
+    for (let lag = minLag; lag <= maxLag; lag++) { let c = 0; for (let i = 0; i < W; i++) c += d[s + i] * d[s + i + lag]; r[lag] = c / e; if (r[lag] > best) { best = r[lag]; bl = lag; } }
+    for (let lag = minLag; lag * 2 <= bl + 1 && bl; lag++) if (r[lag] > best * .9 && Math.abs(lag * 2 - bl) <= 2) { bl = lag; break; }   // octave-down fix
+    f0.push(best > .5 && bl ? rate / bl : 0);
+  }
+  return { hop: hop * f, f0 };
+}
+
+/**
+ * Formant-preserving pitch shift (TD-PSOLA). Pitch moves by `ratio`; formants move by `formant`
+ * (default ratio^0.3, so a deeper voice gets a longer vocal tract, not a "slowed-down" one).
+ * Returns null when too little of the audio is voiced – callers then fall back to pitchShift().
+ */
+function psolaShift(buf, ratio, formant = Math.pow(ratio, .3)) {
+  const x = mono(buf), n = x.length, sr = buf.sampleRate, { hop, f0 } = pitchTrack(x, sr);
+  if (f0.filter(Boolean).length < f0.length * .2) return null;
+  const f0At = p => { const i = Math.min(f0.length - 1, Math.max(0, Math.round(p / hop))); return f0[i]; };
+  // analysis pitch marks: peaks spaced one period apart (voiced) or fixed 10 ms steps (unvoiced)
+  const marks = []; let pos = Math.round(sr * .005);
+  while (pos < n - 2) {
+    const hz = f0At(pos), T = hz ? Math.round(sr / hz) : Math.round(sr * .01);
+    let p = pos;
+    if (hz) { let bv = -Infinity; const q = Math.round(T / 4); for (let i = Math.max(0, pos - q); i <= Math.min(n - 1, pos + q); i++) if (x[i] > bv) { bv = x[i]; p = i; } }
+    marks.push({ p, T, v: !!hz }); pos = p + T;
+  }
+  const out = new Float32Array(n), wsum = new Float32Array(n);
+  let ts = marks[0].p, mi = 0;
+  while (ts < n) {
+    while (mi + 1 < marks.length && Math.abs(marks[mi + 1].p - ts) <= Math.abs(marks[mi].p - ts)) mi++;
+    const m = marks[mi], r = m.v ? ratio : 1, fs = m.v ? formant : 1, L = m.T;
+    for (let k = -L; k <= L; k++) {
+      const o = ts + k, src = m.p + k * fs; if (o < 0 || o >= n || src < 0 || src >= n - 1) continue;
+      const i0 = Math.floor(src), fr = src - i0, w = .5 + .5 * Math.cos(Math.PI * k / L);
+      out[o] += (x[i0] * (1 - fr) + x[i0 + 1] * fr) * w; wsum[o] += w;
+    }
+    ts += Math.max(1, Math.round(m.T / r));
+  }
+  for (let i = 0; i < n; i++) out[i] = wsum[i] > .15 ? out[i] / wsum[i] : out[i] / .15;
+  return { data: out, sr };
 }
 
 /** Duration-preserving pitch shift: resample by `ratio`, then WSOLA time-stretch back to the original length. */
@@ -208,14 +259,23 @@ function bufferSource(buf) {
   } };
 }
 
+const FEMALE_RE = /female|woman|zira|samantha|susan|hazel|karen|victoria|moira|tessa|fiona|heera|kalpana|veena|serena|allison|ava|jenny|aria|google (us|uk) english(?! male)|google हिन्दी|google hindi/i;
+const MALE_RE = /\bmale\b|david|daniel|alex\b|fred|mark|george|guy|james|ryan|thomas|rishi|aaron|arthur|hemant|ravi|prabhat|oliver|christopher|eric|roger|steffan/i;
+const isMaleName = name => !FEMALE_RE.test(name) && MALE_RE.test(name);
+const isMale = v => v.gender ? v.gender === 'male' : (v.pitch || 150) < 165;
+/** Best matching system voice for a language and gender; null lets the browser use its default. */
+function pickSystemVoice(voices, lang, male) {
+  const pool = voices.filter(v => v.lang.toLowerCase().startsWith(lang));
+  return pool.find(v => (male ? isMaleName(v.name) : FEMALE_RE.test(v.name))) || pool.find(v => v.localService) || pool[0] || null;
+}
 /** Browser speech synthesis shaped by a voice profile (pitch ratio) and the stability/similarity sliders. */
 function speakSource(text, voice, stability, similarity) {
   const words = text.trim().split(/\s+/).length;
   return { duration: Math.max(1, words * .4), play(onEnd) {
     const synth = window.speechSynthesis; let off = false; synth.cancel();
-    const parts = text.match(/[^.!?।]+[.!?।]*/g) || [text], hi = voice.cat === 'Hindi';
-    const sv = synth.getVoices().find(v => hi ? v.lang.toLowerCase().startsWith('hi') : v.lang.toLowerCase().startsWith('en')) || null;
-    const ratio = clamp((voice.pitch || 150) / 150, .3, 2.5);
+    const parts = text.match(/[^.!?।]+[.!?।]*/g) || [text], hi = voice.cat === 'Hindi', male = isMale(voice);
+    const sv = pickSystemVoice(synth.getVoices(), hi ? 'hi' : 'en', male);
+    const base = sv ? (isMaleName(sv.name) ? 115 : 200) : 160, ratio = clamp((voice.pitch || 150) / base, .3, 2.5);
     parts.forEach((p, i) => {
       const u = new SpeechSynthesisUtterance(p.trim()); if (sv) { u.voice = sv; u.lang = sv.lang; }
       const jitter = (Math.random() - .5) * (1 - stability) * .6;
@@ -537,7 +597,7 @@ V.v2v = () => {
       const btn = $('#conv', r), voice = findVoice(st.voiceId); btn.disabled = true; btn.textContent = 'Converting…'; stopRec(); await sleep(30);
       try {
         const srcPitch = detectPitch(st.sample.buf); if (!srcPitch) toast('Couldn’t detect the pitch of your audio – converting at neutral');
-        const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, shifted = pitchShift(st.sample.buf, ratio), sr = shifted.sr, data = applyFx(shifted.data, sr, voice.fx);
+        const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, shifted = psolaShift(st.sample.buf, ratio) || pitchShift(st.sample.buf, ratio), sr = shifted.sr, data = applyFx(shifted.data, sr, voice.fx);
         const out = ac().createBuffer(1, data.length, sr); out.copyToChannel(data, 0);
         const id = uid(), blob = encodeWav(data, sr); await blobs.put('audio:' + id, blob);
         S.v2vResult = { id, original: st.sample.buf, converted: out, blob, voice: voice.name };

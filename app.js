@@ -57,7 +57,16 @@ const cloud = (() => {
   const safe = async fn => { try { const r = await fn(); if (r?.error) throw r.error; return r; } catch (e) { console.warn('[cloud]', e.message || e); return null; } };
   const path = f => `${uid_}/${f.replace(':', '-')}`;
   return {
-    on,
+    on, hosted: on && !!cfg.HOSTED_VOICES,
+    /** POST to the voice-api Edge Function (ElevenLabs proxy). `body` is a JSON string or FormData. */
+    async fn(path, body) {
+      const { data } = await sb.auth.getSession(), token = data.session?.access_token;
+      if (!token) throw new Error('sign in required');
+      const r = await fetch(`${cfg.SUPABASE_URL}/functions/v1/voice-api/${path}`, { method: 'POST', body,
+        headers: { authorization: `Bearer ${token}`, apikey: cfg.SUPABASE_KEY, ...(typeof body === 'string' ? { 'content-type': 'application/json' } : {}) } });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `request failed (${r.status})`);
+      return r;
+    },
     async session() { const { data } = await sb.auth.getSession(); const u = data.session?.user || null; uid_ = u?.id || null; return u; },
     async auth(mode, email, password) {
       const { data, error } = mode === 'up' ? await sb.auth.signUp({ email, password }) : await sb.auth.signInWithPassword({ email, password });
@@ -67,9 +76,9 @@ const cloud = (() => {
     async pull() {
       const [v, r] = await Promise.all([sb.from('voices').select('*').order('created', { ascending: false }), sb.from('recents').select('*').order('ts', { ascending: false }).limit(20)]);
       if (v.error || r.error) return null;
-      return { voices: v.data.map(({ user_id, ...x }) => x), recents: r.data.map(({ user_id, voice_id, ...x }) => ({ ...x, voiceId: voice_id })) };
+      return { voices: v.data.map(({ user_id, remote_id, ...x }) => ({ ...x, remote: remote_id })), recents: r.data.map(({ user_id, voice_id, ...x }) => ({ ...x, voiceId: voice_id })) };
     },
-    upsertVoice: v => on && uid_ && safe(() => sb.from('voices').upsert({ id: v.id, name: v.name, cat: v.cat, pitch: v.pitch, gender: v.gender ?? null, dur: v.dur, created: v.created }, { onConflict: 'user_id,id' })),
+    upsertVoice: v => on && uid_ && safe(() => sb.from('voices').upsert({ id: v.id, name: v.name, cat: v.cat, pitch: v.pitch, gender: v.gender ?? null, remote_id: v.remote ?? null, dur: v.dur, created: v.created }, { onConflict: 'user_id,id' })),
     deleteVoice: id => on && uid_ && safe(() => sb.from('voices').delete().eq('id', id)),
     upsertRecent: a => on && uid_ && safe(() => sb.from('recents').upsert({ id: a.id, kind: a.kind, title: a.title, text: a.text ?? null, voice_id: a.voiceId ?? null, ts: a.ts, dur: a.dur }, { onConflict: 'user_id,id' })),
     deleteRecent: id => on && uid_ && safe(() => sb.from('recents').delete().eq('id', id)),
@@ -108,7 +117,7 @@ const S = {
   recents: ls.get('recents', []),
   draft: null,                  // voice being created: { blob, buf, dur }
   consent: false,
-  tts: { sysVoice: ls.get('sysvoice', ''), voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.', stability: .7, similarity: .8 },
+  tts: { sysVoice: ls.get('sysvoice', ''), voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.', stability: .7, similarity: .6 },
   ttsResult: null, v2v: { sample: null, voiceId: null }, v2vResult: null,
   libTab: 'mine', libQuery: '', stopPlayback: null,
 };
@@ -162,7 +171,8 @@ function pitchTrack(x, sr) {
     for (let lag = minLag; lag * 2 <= bl + 1 && bl; lag++) if (r[lag] > best * .9 && Math.abs(lag * 2 - bl) <= 2) { bl = lag; break; }   // octave-down fix
     f0.push(best > .5 && bl ? rate / bl : 0);
   }
-  return { hop: hop * f, f0 };
+  const sm = f0.map((v, i) => { if (!v) return 0; const w = []; for (let k = -2; k <= 2; k++) if (f0[i + k]) w.push(f0[i + k]); w.sort((p, q) => p - q); return w[w.length >> 1]; });
+  return { hop: hop * f, f0: sm };   // median-smoothed so pitch marks don't jitter
 }
 
 /**
@@ -244,6 +254,13 @@ function encodeWav(data, sr) {
   return new Blob([b], { type: 'audio/wav' });
 }
 
+/** Mono 22.05 kHz WAV of the first `maxSec` seconds – small enough to upload to the hosted voice API. */
+function wavForUpload(buf, maxSec = 180, sr = 22050) {
+  const x = mono(buf), step = buf.sampleRate / sr, n = Math.min(Math.floor(x.length / step), Math.floor(maxSec * sr)), d = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const p = i * step, i0 = Math.floor(p), fr = p - i0; d[i] = x[i0] * (1 - fr) + (x[i0 + 1] ?? x[i0]) * fr; }
+  return encodeWav(d, sr);
+}
+
 const peaks = (buf, count = 40) => {
   const x = mono(buf), step = Math.max(1, Math.floor(x.length / count)), out = [];
   for (let i = 0; i < count; i++) { let m = 0; for (let k = 0; k < step; k += 8) m = Math.max(m, Math.abs(x[i * step + k] || 0)); out.push(m); }
@@ -318,7 +335,8 @@ async function neuralSpeech(text, voice, st, onStatus, cancelled = () => false) 
   let o = 0; parts.forEach(p => { data.set(p, o); o += p.length + gap; });
   const base = ac().createBuffer(1, n, sr); base.copyToChannel(data, 0);
   let out = { data, sr }; const bp = detectPitch(base), eff = 1 + ((voice.pitch || bp) / (bp || 1) - 1) * st.similarity;
-  if (bp && Math.abs(eff - 1) > .04) { const r = clamp(eff, .6, 1.8); out = psolaShift(base, r) || pitchShift(base, r); }
+  // shifts under ~12% add artifacts without being audible, so skip them
+  if (bp && Math.abs(eff - 1) > .12) { const r = clamp(eff, .75, 1.35); out = psolaShift(base, r) || pitchShift(base, r); }
   const fx = applyFx(out.data, out.sr, voice.fx); let peak = 0; for (let i = 0; i < fx.length; i++) peak = Math.max(peak, Math.abs(fx[i]));
   if (peak > 0) for (let i = 0; i < fx.length; i++) fx[i] *= .9 / peak;
   return { data: fx, sr: out.sr };
@@ -536,7 +554,7 @@ const chosenHtml = d => `<div class="filechip" style="display:block">${playerHtm
 
 V.consent = () => ({
   html: `<section class="screen">${top('Voice Consent')}<div class="consent"><div class="ic">${icon('doc')}</div><h2>Confirm Permission</h2>
-    <p class="muted">I confirm that I have the right and permission to clone this voice and will use it responsibly.</p></div>
+    <p class="muted">I confirm that I have the right and permission to clone this voice and will use it responsibly.</p>${cloud.hosted ? '<p class="muted">Your sample is sent to our voice provider (ElevenLabs) to build the clone, and deleted there when you delete the voice.</p>' : ''}</div>
     <label class="check"><input type="checkbox" id="ok"><span>I agree to the <a href="#/consent" data-toast="Terms of Use">Terms of Use</a> and <a href="#/consent" data-toast="AI Voice Policy">AI Voice Policy</a></span></label>
     <button class="btn" id="next" disabled>Continue</button></section>`,
   bind: r => {
@@ -577,10 +595,15 @@ V.created = () => ({
   bind: r => {
     const d = S.draft; if (!d || !d.tmpId) return go('create');
     bindPlayer($('#pl', r), async () => bufferSource(d.buf));
-    $('#save', r).onclick = () => {
+    $('#save', r).onclick = async () => {
       const name = $('#name', r).value.trim(); if (!name) return toast('Please enter a name');
       const g = $('#gender', r).value, pitch = d.pitch || 150, v = { id: d.tmpId, name, cat: $('#cat', r).value, pitch, gender: g === 'auto' ? (pitch < 165 ? 'male' : 'female') : g, dur: d.dur, created: Date.now() };
-      S.voices.unshift(v); saveVoices(); cloud.upsertVoice(v); cloud.putBlob('sample:' + v.id, d.blob); S.draft = null; toast('Voice saved'); go('library');
+      if (cloud.hosted) {
+        const btn = $('#save', r); btn.disabled = true; btn.textContent = 'Cloning your voice…';
+        try { const f = new FormData(); f.set('name', name); f.set('file', wavForUpload(d.buf), 'sample.wav'); v.remote = (await (await cloud.fn('clone', f)).json()).voice_id; }
+        catch (e) { toast(`Hosted cloning failed (${String(e.message).slice(0, 70)}) – saved with the built-in profile`); }
+      }
+      S.voices.unshift(v); saveVoices(); await cloud.upsertVoice(v); cloud.putBlob('sample:' + v.id, d.blob); S.draft = null; if (v.remote) toast('Voice cloned and saved'); else if (!cloud.hosted) toast('Voice saved'); go('library');
     };
   } });
 
@@ -603,7 +626,7 @@ V.library = () => ({
       });
       $$('[data-menu]', r).forEach(b => b.onclick = async () => {
         const v = findVoice(b.closest('.row').dataset.id), a = prompt(`"${v.name}" – type "rename" or "delete"`, 'rename'); if (!a) return;
-        if (a.toLowerCase() === 'delete' && confirm(`Delete ${v.name}?`)) { S.voices = S.voices.filter(x => x.id !== v.id); saveVoices(); cloud.deleteVoice(v.id); blobs.del('sample:' + v.id); }
+        if (a.toLowerCase() === 'delete' && confirm(`Delete ${v.name}?`)) { if (v.remote && cloud.hosted) await cloud.fn('delete', JSON.stringify({ voice_id: v.remote })).catch(e => toast(`Couldn’t remove the hosted voice (${String(e.message).slice(0, 60)})`)); S.voices = S.voices.filter(x => x.id !== v.id); saveVoices(); cloud.deleteVoice(v.id); blobs.del('sample:' + v.id); }
         else if (a.toLowerCase() === 'rename') { const n = prompt('New name', v.name); if (n && n.trim()) { v.name = n.trim().slice(0, 40); saveVoices(); cloud.upsertVoice(v); } }
         draw();
       });
@@ -654,7 +677,15 @@ V['tts-result'] = () => {
       $('#cancel', r).onclick = () => { cancelled = true; neural.reset(); go('tts'); };
       $('#usedev', r).onclick = () => { device = true; neural.reset(); startDevice(); };
       let startDevice = () => {};
-      if (needsDeviceVoice(res.text, S.tts.sysVoice)) device = true;
+      if (v.remote && cloud.hosted) {
+        try {
+          status('Generating with your cloned voice…', .3);
+          blob = await (await cloud.fn('tts', JSON.stringify({ voice_id: v.remote, text: res.text, stability: S.tts.stability, similarity: S.tts.similarity }))).blob();
+          buf = await decode(blob);
+        } catch (e) { if (cancelled) return; blob = null; toast(`Hosted voice unavailable (${String(e.message).slice(0, 60)}) – using the built-in voice`); }
+      }
+      if (buf) { /* hosted audio ready */ }
+      else if (needsDeviceVoice(res.text, S.tts.sysVoice)) device = true;
       else {
         try {
           const out = await new Promise((resolve, reject) => {
@@ -678,10 +709,10 @@ V['tts-result'] = () => {
     if (res.fresh) { res.fresh = false; const item = { id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); if (blob) blobs.put('audio:' + res.id, blob); }
     setTimeout(() => $('.play', r)?.click(), 250);
     $('#again', r).onclick = () => { if (device) { p(); $('.play', r).click(); } else { res.buf = res.blob = null; res.fresh = false; render(); } };
-    $('#sh', r).onclick = async () => { if (blob && navigator.canShare?.({ files: [new File([blob], 'jolovocals.wav', { type: 'audio/wav' })] })) return navigator.share({ files: [new File([blob], 'jolovocals.wav', { type: 'audio/wav' })] }).catch(() => {});
+    $('#sh', r).onclick = async () => { if (blob && navigator.canShare?.({ files: [new File([blob], blob.type.includes('mpeg') ? 'jolovocals.mp3' : 'jolovocals.wav', { type: blob.type || 'audio/wav' })] })) return navigator.share({ files: [new File([blob], blob.type.includes('mpeg') ? 'jolovocals.mp3' : 'jolovocals.wav', { type: blob.type || 'audio/wav' })] }).catch(() => {});
       navigator.share ? navigator.share({ title: 'JoloVocals', text: res.text }).catch(() => {}) : navigator.clipboard?.writeText(res.text).then(() => toast('Text copied')); };
     $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); blobs.del('audio:' + res.id); S.ttsResult = null; go('tts'); };
-    $('#dl', r).onclick = () => { if (!blob) return; const l = document.createElement('a'); l.href = URL.createObjectURL(blob); l.download = `jolovocals-${res.id}.wav`; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 1000); };
+    $('#dl', r).onclick = () => { if (!blob) return; const l = document.createElement('a'); l.href = URL.createObjectURL(blob); l.download = `jolovocals-${res.id}.${blob.type.includes('mpeg') ? 'mp3' : 'wav'}`; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 1000); };
   } };
 };
 
@@ -699,10 +730,19 @@ V.v2v = () => {
     $('#conv', r).onclick = async () => {
       const btn = $('#conv', r), voice = findVoice(st.voiceId); btn.disabled = true; btn.textContent = 'Converting…'; stopRec(); await sleep(30);
       try {
-        const srcPitch = detectPitch(st.sample.buf); if (!srcPitch) toast('Couldn’t detect the pitch of your audio – converting at neutral');
-        const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, shifted = psolaShift(st.sample.buf, ratio) || pitchShift(st.sample.buf, ratio), sr = shifted.sr, data = applyFx(shifted.data, sr, voice.fx);
-        const out = ac().createBuffer(1, data.length, sr); out.copyToChannel(data, 0);
-        const id = uid(), blob = encodeWav(data, sr); await blobs.put('audio:' + id, blob);
+        let out, blob;
+        if (voice.remote && cloud.hosted) {
+          try {
+            const f = new FormData(); f.set('voice_id', voice.remote); f.set('audio', wavForUpload(st.sample.buf, 120), 'input.wav'); f.set('stability', S.tts.stability); f.set('similarity', S.tts.similarity);
+            blob = await (await cloud.fn('sts', f)).blob(); out = await decode(blob);
+          } catch (e) { blob = out = null; toast(`Hosted conversion unavailable (${String(e.message).slice(0, 60)}) – using the built-in converter`); }
+        }
+        if (!out) {
+          const srcPitch = detectPitch(st.sample.buf); if (!srcPitch) toast('Couldn’t detect the pitch of your audio – converting at neutral');
+          const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, shifted = psolaShift(st.sample.buf, ratio) || pitchShift(st.sample.buf, ratio), sr = shifted.sr, data = applyFx(shifted.data, sr, voice.fx);
+          out = ac().createBuffer(1, data.length, sr); out.copyToChannel(data, 0); blob = encodeWav(data, sr);
+        }
+        const id = uid(); await blobs.put('audio:' + id, blob);
         S.v2vResult = { id, original: st.sample.buf, converted: out, blob, voice: voice.name };
         const item = { id, kind: 'v2v', title: `Converted to ${voice.name}`, ts: Date.now(), dur: out.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); go('v2v-result');
       } catch (e) { console.error(e); toast('Conversion failed'); btn.disabled = false; btn.textContent = 'Convert Audio'; }
@@ -723,7 +763,7 @@ V['v2v-result'] = () => {
     const draw = () => { const buf = res[which]; $('#pl', r).innerHTML = playerHtml(peaks(buf), buf.duration, true); halt = bindPlayer($('#pl', r), async () => bufferSource(res[which])); };
     draw();
     $$('.seg button', r).forEach(b => b.onclick = () => { if (b.disabled) return; halt(); which = b.dataset.w; $$('.seg button', r).forEach(x => x.classList.toggle('on', x === b)); draw(); });
-    $('#dl', r).onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(res.blob); a.download = `jolovocals-${res.id}.wav`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
+    $('#dl', r).onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(res.blob); a.download = `jolovocals-${res.id}.${res.blob.type.includes('mpeg') ? 'mp3' : 'wav'}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
     $('#sh', r).onclick = async () => { const f = new File([res.blob], 'jolovocals.wav', { type: 'audio/wav' });
       if (navigator.canShare?.({ files: [f] })) navigator.share({ files: [f] }).catch(() => {}); else toast('Sharing files isn’t supported here – use Download'); };
     $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); blobs.del('audio:' + res.id); S.v2vResult = null; go('v2v'); };

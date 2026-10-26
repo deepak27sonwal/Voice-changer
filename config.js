@@ -2,5 +2,7 @@
 // Leave SUPABASE_KEY empty to run in local-only mode (data stays in this browser).
 window.JV_CONFIG = {
   SUPABASE_URL: 'https://momlbowaouglejezotab.supabase.co',
+  // Set true after deploying supabase/functions/voice-api (see README) to clone voices with a hosted provider.
+  HOSTED_VOICES: false,
   SUPABASE_KEY: 'sb_publishable_EeBM_d1Xf63sxjNG9XaAOA_3Mjm_qnY',
 };

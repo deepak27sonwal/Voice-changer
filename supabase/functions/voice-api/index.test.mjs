@@ -54,5 +54,5 @@ test('delete removes an owned voice', async () => assert.equal((await handle(pos
 test('provider errors surface as readable messages', async () => {
   const d = { ...deps(), fetch: async u => String(u).endsWith('/auth/v1/user') ? new Response('{}') : String(u).includes('/rest/') ? new Response('[{"id":1}]') : new Response('{"detail":{"message":"quota exceeded"}}', { status: 401 }) };
   const r = await handle(post('tts', { voice_id: 'abcdefghij123', text: 'hi' }), d);
-  assert.equal(r.status, 401); assert.equal((await r.json()).error, 'quota exceeded');
+  assert.equal(r.status, 401); assert.equal((await r.json()).error, 'ElevenLabs 401: quota exceeded');
 });

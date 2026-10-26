@@ -625,7 +625,7 @@ function hostedWithProgress(pl, path, body, expectSec, ctl, waitLabel) {
 /* ───────────── views ───────────── */
 const nav = on => `<nav class="bottom">
   ${[['home', 'home', 'Home'], ['tts', 'text', 'Generate']].map(([r, ic, l]) => `<button data-go="${r}" class="${on === r ? 'on' : ''}">${icon(ic)}${l}</button>`).join('')}
-  <button class="mic" data-go="v2v" aria-label="Voice to voice">${icon('mic')}</button>
+  <button class="mic ${on === 'v2v' ? 'on' : ''}" data-go="v2v" aria-label="Voice to voice">${icon('mic')}<span class="nav-l">Voice to Voice</span></button>
   ${[['library', 'lib', 'Library'], ['profile', 'user', 'Profile']].map(([r, ic, l]) => `<button data-go="${r}" class="${on === r ? 'on' : ''}">${icon(ic)}${l}</button>`).join('')}</nav>`;
 const top = (title, back = true) => `<div class="top">${back ? `<button class="icon-btn" data-back aria-label="Back">${icon('back')}</button>` : ''}<h2>${title}</h2></div>`;
 /** Custom dropdown. Renders <div class="dd" id=…>; after bind, `el.value` and a 'change' event work like a <select>. */
@@ -729,7 +729,7 @@ function applyTemplate(t) {
   S.vs = { ...VS_DEFAULTS, ...t.vs }; saveVs();
   toast(`${t.emoji} ${t.title} loaded – edit it or tap Generate`);
 }
-const templateCards = () => TEMPLATES.map((t, i) => `<button type="button" class="tpl" data-tpl="${i}"><span class="tpl-emoji">${t.emoji}</span><strong>${t.title}</strong><small>${esc(stripTags(t.text).slice(0, 48))}…</small></button>`).join('');
+const templateCards = () => TEMPLATES.map((t, i) => `<button type="button" class="tpl" data-tpl="${i}"><span class="tpl-emoji">${t.emoji}</span><strong>${t.title}</strong><small>${esc(t.text.replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim().slice(0, 48))}…</small></button>`).join('');
 
 /* Usage dashboard: ElevenLabs credits plus streak/week stats from history (or local recents). */
 const dayKey = t => { const d = new Date(t); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
@@ -783,7 +783,7 @@ V.splash = () => ({
 
 V.login = () => {
   let mode = 'in';
-  return { html: `<section class="screen"><div class="center" style="margin:6px 0 18px"><div class="brand" style="font-size:34px">Jolo<b>Vocals</b></div><div class="muted">AI Voice Studio</div></div>
+  return { html: `<section class="screen auth"><div class="center" style="margin:6px 0 18px"><div class="brand" style="font-size:34px">Jolo<b>Vocals</b></div><div class="muted">AI Voice Studio</div></div>
     <div class="tabs"><button class="on" data-m="in">Sign In</button><button data-m="up">Sign Up</button></div>
     <button class="social" data-demo><b style="color:#ea4335;width:22px;text-align:center">G</b>Continue with Google</button>
     <button class="social" data-demo><span style="width:22px;text-align:center">📞</span>Continue with Mobile</button>
@@ -813,7 +813,7 @@ V.login = () => {
 
 V.home = () => {
   const items = S.recents.slice(0, 3), tip = TIPS[Math.floor(Math.random() * TIPS.length)];
-  return { html: `<section class="screen has-nav"><div class="top"><div class="brand" style="font-size:24px;flex:1">Jolo<b>Vocals</b> <span class="pro">Pro</span></div>${installHtml('install-chip')}</div>
+  return { html: `<section class="screen has-nav"><div class="top home-top"><div class="brand" style="font-size:24px;flex:1">Jolo<b>Vocals</b> <span class="pro">Pro</span></div>${installHtml('install-chip')}</div>
     <div class="hello">Hello, ${esc(S.user.name)} 👋</div><p class="muted tip">💡 ${tip}</p>
     <button type="button" class="ucard" id="usage" ${cloud.hosted ? 'data-go="history"' : ''} aria-label="Your usage"><div class="u-stats"><div><b>…</b><small>loading</small></div></div></button>
     <button class="mcard live-card" data-go="live"><span class="ic">${icon('mic')}</span><span class="grow"><strong>Live Voice Changer</strong><small>Talk and hear yourself as a robot, monster, alien…</small></span>${icon('arrow')}</button>
@@ -947,22 +947,38 @@ V.library = () => ({
 
 V.tts = () => {
   const t = S.tts; t.voiceId = findVoice(t.voiceId) ? t.voiceId : allVoices()[0].id;
-  return { html: `<section class="screen has-nav">${top('Text to Voice')}
-    <label class="lbl" style="margin-top:0">Select Voice</label>${voiceDropdown('v', t.voiceId)}
-    <label class="lbl">Offline voice <span class="muted" style="font-weight:400">– used only when ElevenLabs is unavailable</span></label>${baseVoiceDropdown('sys', t.sysVoice)}
-    <div class="lbl-row"><label class="lbl">Enter Text</label><button type="button" class="tag tpl-open" id="tpl-open">✨ Templates</button></div>
+  const TAG_ICON = { Emotion: '😊', Delivery: '🎭', Pause: '⏸️' };
+  return { html: `<section class="screen has-nav tts-screen">${top('Text to Voice')}
+    <div class="tts-grid"><div class="tts-main">
+      <div class="panel"><div class="panel-head"><strong>Voice</strong><span class="muted">★ favourite · ▶ preview</span></div>${voiceDropdown('v', t.voiceId)}</div>
+      <div class="panel editor">
+        <div class="panel-head"><strong>Script</strong><button type="button" class="chip-btn" id="tpl-open">✨ Templates</button></div>
+        <textarea class="editor-text" id="txt" maxlength="5000" placeholder="Type what the voice should say… Add tags like [laughs] or [pause 1s] for expression." aria-label="Text to speak">${esc(t.text)}</textarea>
+        <div class="tagbar" aria-label="Insert a tag">
+          <div class="tagtabs" role="tablist">${TAG_GROUPS.map(([g], k) => `<button type="button" role="tab" class="tagtab ${k ? '' : 'on'}" data-tg="${k}" aria-selected="${!k}">${TAG_ICON[g] || ''} ${g}</button>`).join('')}</div>
+          ${TAG_GROUPS.map(([, tags], k) => `<div class="tagchips" data-tgp="${k}" role="tabpanel" ${k ? 'hidden' : ''}>${tags.map(x => `<button type="button" class="tag" data-tag="${x}">${x}</button>`).join('')}</div>`).join('')}
+        </div>
+        <div class="editor-foot"><span class="muted">Tags are performed by ElevenLabs voices</span><span class="muted"><span id="cnt">${t.text.length}</span> / 5000</span></div>
+      </div>
+    </div>
+    <aside class="tts-side">
+      ${settingsHtml(['stability', 'similarity', 'style', 'speed', 'pitch', 'volume'], true)}
+      <details class="vs"><summary>Advanced</summary><label class="lbl" style="margin-top:6px">Offline voice</label>
+        <p class="muted" style="font-size:12px;margin-bottom:8px">Used only when ElevenLabs is unavailable.</p>${baseVoiceDropdown('sys', t.sysVoice)}</details>
+    </aside></div>
     <div class="overlay" id="tpl-sheet" hidden><div class="ov-card sheet" role="dialog" aria-label="Templates"><h3 class="center">Templates</h3><div class="tpl-list">${templateCards()}</div><button class="btn ghost" id="tpl-close">Close</button></div></div>
-    <div class="tags" aria-label="Insert a tag">${TAG_GROUPS.map(([g, tags]) => `<div class="tag-row"><span class="muted">${g}</span>${tags.map(x => `<button type="button" class="tag" data-tag="${x}">${x}</button>`).join('')}</div>`).join('')}</div>
-    <textarea class="field" id="txt" maxlength="5000" placeholder="Type what the voice should say…">${esc(t.text)}</textarea>
-    <div class="muted" style="display:flex;justify-content:space-between;font-size:12px"><span>Tags are performed by ElevenLabs voices; other voices keep pauses and skip the rest.</span><span style="white-space:nowrap;margin-left:8px"><span id="cnt">${t.text.length}</span>/5000</span></div>
-    ${settingsHtml(['stability', 'similarity', 'style', 'speed', 'pitch', 'volume'], true)}
-    <div class="grow"></div><button class="btn" id="gen">${icon('wave')} Generate Speech</button>${nav('tts')}</section>`,
+    <div class="gen-bar"><button class="btn" id="gen">${icon('wave')} Generate Speech</button></div>${nav('tts')}</section>`,
   bind: r => {
     if (!('speechSynthesis' in window)) toast('Speech synthesis is not supported in this browser');
     $('#v', r).onchange = e => { t.voiceId = e.target.value; };
     $('#sys', r).onchange = e => { t.sysVoice = e.target.value; ls.set('sysvoice', t.sysVoice); toast(t.sysVoice ? 'Base voice set' : 'Base voice: automatic'); };
     if (!speechSynthesis.getVoices().length) speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash === '#/tts') render(); }, { once: true });
-    $('#txt', r).oninput = e => { t.text = e.target.value; $('#cnt', r).textContent = t.text.length; };
+    const ta = $('#txt', r), grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(420, Math.max(140, ta.scrollHeight + 2)) + 'px'; };
+    ta.oninput = e => { t.text = e.target.value; $('#cnt', r).textContent = t.text.length; grow(); }; grow();
+    $$('[data-tg]', r).forEach(b => b.onclick = () => {
+      $$('[data-tg]', r).forEach(x => { x.classList.toggle('on', x === b); x.setAttribute('aria-selected', x === b); });
+      $$('[data-tgp]', r).forEach(p => { p.hidden = p.dataset.tgp !== b.dataset.tg; });
+    });
     $$('[data-tag]', r).forEach(b => b.onclick = () => {
       const ta = $('#txt', r), s = ta.selectionStart ?? ta.value.length, e = ta.selectionEnd ?? s, ins = `[${b.dataset.tag}]` + (/^\s/.test(ta.value.slice(e)) ? '' : ' ');
       const pre = ta.value.slice(0, s), lead = pre && !/\s$/.test(pre) ? ' ' : '';
@@ -1297,6 +1313,7 @@ function render() {
   $$('[data-go]', app).forEach(b => b.onclick = () => go(b.dataset.go));
   $$('[data-back]', app).forEach(b => b.onclick = () => history.length > 1 ? history.back() : go('home'));
   $$('[data-install]', app).forEach(b => b.onclick = async () => { if (!installEvt) return; installEvt.prompt(); await installEvt.userChoice.catch(() => {}); installEvt = null; $$('[data-install]').forEach(x => { x.hidden = true; }); });
+  document.body.classList.toggle('with-nav', !!$('nav.bottom', app));
   bindDropdowns(app); const c = view.bind(app); app.scrollTo?.(0, 0); window.scrollTo(0, 0);
   if (c && c.catch) c.catch(console.error);
 }

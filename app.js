@@ -110,6 +110,12 @@ const cloud = (() => {
       if (kind) q = q.eq('kind', kind);
       const { data, error } = await q; if (error) throw error; return data;
     },
+    async usage() { return (await this.fn('usage', '{}')).json(); },
+    /** Timestamps (ms) of the caller's generations in the last 90 days, for streak/week stats. */
+    async historyDates() {
+      const { data, error } = await sb.from('generation_history').select('created_at').gte('created_at', new Date(Date.now() - 90 * 864e5).toISOString()).order('created_at', { ascending: false }).limit(1000);
+      if (error) throw error; return data.map(x => Date.parse(x.created_at));
+    },
     async deleteHistory(id) { await this.fn('history-delete', JSON.stringify({ id })); },
     async historyAudio(path) { const { data, error } = await sb.storage.from('voice-audio').download(path); if (error) throw error; return data; },
     async pull() {
@@ -161,7 +167,8 @@ const S = {
   vs: { ...VS_DEFAULTS, ...ls.get('voicesettings', {}) },   // voice control settings, shared by Text to Voice and Voice to Voice
   ttsResult: null, v2v: { sample: null, voiceId: null }, v2vResult: null,
   libTab: 'mine', libQuery: '', stopPlayback: null,
-  elVoices: ls.get('elvoices', []),   // voices from the ElevenLabs account (hosted mode)
+  elVoices: ls.get('elvoices', []),
+  live: { preset: 'robot', pitch: 0, echo: 0, reverb: 0, monitor: true, ...ls.get('live', {}) },   // voices from the ElevenLabs account (hosted mode)
 };
 const allVoices = () => [...S.voices, ...S.elVoices, ...PRESETS];
 const LANGS = { hi: 'Hindi', en: 'English', kn: 'Kannada', ta: 'Tamil', te: 'Telugu', mr: 'Marathi', bn: 'Bengali', pt: 'Portuguese', de: 'German', nl: 'Dutch', it: 'Italian', tr: 'Turkish' };
@@ -484,6 +491,99 @@ function applyControls(buf, vs = S.vs) {
   const out = ac().createBuffer(1, data.length, buf.sampleRate); out.copyToChannel(data, 0); return out;
 }
 
+/* ───────────── effects: live voice changer + FX rack ───────────── */
+const FX_PRESETS = [
+  { id: 'none', name: 'Natural', emoji: '🎙️' },
+  { id: 'robot', name: 'Robot', emoji: '🤖', ring: 50 },
+  { id: 'monster', name: 'Monster', emoji: '👹', pitch: -6, lowpass: 1800 },
+  { id: 'chipmunk', name: 'Chipmunk', emoji: '🐿️', pitch: 7 },
+  { id: 'alien', name: 'Alien', emoji: '👽', pitch: 4, ring: 30 },
+  { id: 'radio', name: 'Radio', emoji: '📻', band: [500, 3000], drive: 4 },
+  { id: 'phone', name: 'Telephone', emoji: '☎️', band: [400, 3400], drive: 2 },
+  { id: 'echo', name: 'Echo', emoji: '🏔️', echo: .45 },
+  { id: 'stadium', name: 'Stadium', emoji: '🏟️', reverb: .6, echo: .2 },
+  { id: 'cave', name: 'Cave', emoji: '🕳️', pitch: -2, reverb: .8 },
+  { id: 'ghost', name: 'Ghost', emoji: '👻', pitch: 3, highpass: 1200, reverb: .5 },
+];
+const fxPreset = id => FX_PRESETS.find(p => p.id === id) || FX_PRESETS[0];
+/** Decaying-noise impulse response for the reverb. */
+const makeImpulse = (ctx, seconds = 2.5, decay = 3) => {
+  const n = Math.floor(ctx.sampleRate * seconds), ir = ctx.createBuffer(2, n, ctx.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n) ** decay; }
+  return ir;
+};
+/**
+ * Effect chain shared by live mode and offline rendering (pitch is handled separately).
+ * `fx` = preset plus overrides { echo, reverb }. Connects `input` and returns the output node.
+ */
+function buildFxChain(ctx, fx, input) {
+  let node = input;
+  const link = n => { node.connect(n); node = n; };
+  const filter = (type, f) => { const b = ctx.createBiquadFilter(); b.type = type; b.frequency.value = f; link(b); };
+  if (fx.lowpass) filter('lowpass', fx.lowpass);
+  if (fx.highpass) filter('highpass', fx.highpass);
+  if (fx.band) { filter('highpass', fx.band[0]); filter('lowpass', fx.band[1]); }
+  if (fx.drive) {
+    const ws = ctx.createWaveShaper(), k = fx.drive * 10, n = 1024, curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) { const x = i * 2 / n - 1; curve[i] = (1 + k) * x / (1 + k * Math.abs(x)); }
+    ws.curve = curve; link(ws);
+  }
+  if (fx.ring) {   // ring modulation: signal × sine
+    const g = ctx.createGain(), osc = ctx.createOscillator(); g.gain.value = 0; osc.frequency.value = fx.ring; osc.connect(g.gain); osc.start(); link(g);
+  }
+  const out = ctx.createGain(), dry = ctx.createGain(), echo = fx.echo || 0, reverb = fx.reverb || 0;
+  dry.gain.value = 1 - reverb * .35; node.connect(dry); dry.connect(out);
+  if (echo > 0) {
+    const d = ctx.createDelay(1), fb = ctx.createGain(), wet = ctx.createGain();
+    d.delayTime.value = .28; fb.gain.value = Math.min(.75, echo * .9); wet.gain.value = echo;
+    node.connect(d); d.connect(fb); fb.connect(d); d.connect(wet); wet.connect(out);
+  }
+  if (reverb > 0) { const cv = ctx.createConvolver(), wet = ctx.createGain(); cv.buffer = makeImpulse(ctx); wet.gain.value = reverb; node.connect(cv); cv.connect(wet); wet.connect(out); }
+  return out;
+}
+/** Applies an effect preset to finished audio (pitch via the formant-preserving shifter, the rest via OfflineAudioContext). */
+async function renderFx(buf, fx) {
+  let data = mono(buf); const sr = buf.sampleRate;
+  if (fx.pitch) { const r = 2 ** (fx.pitch / 12); data = (psolaShift(buf, r) || pitchShift(buf, r)).data; }
+  const tail = ((fx.echo || 0) > 0 ? 1.5 : 0) + ((fx.reverb || 0) > 0 ? 2.5 : 0);
+  const octx = new OfflineAudioContext(1, data.length + Math.ceil(tail * sr), sr), src = octx.createBufferSource(), inBuf = octx.createBuffer(1, data.length, sr);
+  inBuf.copyToChannel(data, 0); src.buffer = inBuf; buildFxChain(octx, fx, src).connect(octx.destination); src.start();
+  const out = await octx.startRendering(), d = out.getChannelData(0); let peak = 0;
+  for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i]));
+  if (peak > .95) for (let i = 0; i < d.length; i++) d[i] *= .95 / peak;
+  return out;
+}
+/** "Effects" chip row for result screens. `onPick(preset)` re-renders the audio. */
+const fxRowHtml = sel => `<div class="fxrow" role="group" aria-label="Effects"><span class="muted">Effects</span>${FX_PRESETS.map(p => `<button type="button" class="fxchip ${p.id === sel ? 'on' : ''}" data-fx="${p.id}">${p.emoji} ${p.name}</button>`).join('')}</div>`;
+function bindFxRow(r, onPick) {
+  $$('[data-fx]', r).forEach(b => b.onclick = async () => {
+    if (b.classList.contains('on') || b.disabled) return;
+    $$('[data-fx]', r).forEach(x => { x.disabled = true; x.classList.toggle('on', x === b); });
+    try { await onPick(fxPreset(b.dataset.fx)); } catch (e) { console.error(e); toast('Couldn’t apply that effect'); }
+    $$('[data-fx]', r).forEach(x => { x.disabled = false; });
+  });
+}
+/* Real-time pitch shifter: two crossfaded taps sweeping through a short delay line (runs in the audio thread). */
+const PITCH_WORKLET = `class PitchShifter extends AudioWorkletProcessor {
+  static get parameterDescriptors() { return [{ name: 'ratio', defaultValue: 1, minValue: 0.25, maxValue: 4 }]; }
+  constructor() { super(); this.N = 2048; this.buf = new Float32Array(this.N); this.w = 0; this.ph = 0; }
+  read(pos) { const N = this.N, p = ((pos % N) + N) % N, i = Math.floor(p), f = p - i; return this.buf[i] * (1 - f) + this.buf[(i + 1) % N] * f; }
+  process(inputs, outputs, params) {
+    const inp = inputs[0] && inputs[0][0], out = outputs[0][0]; if (!out) return true;
+    const ratio = params.ratio[0], N = this.N;
+    for (let i = 0; i < out.length; i++) {
+      this.buf[this.w] = inp ? inp[i] : 0;
+      this.ph = (this.ph + (1 - ratio) / N + 1) % 1;
+      const p2 = (this.ph + 0.5) % 1, g1 = 0.5 - 0.5 * Math.cos(2 * Math.PI * this.ph), g2 = 0.5 - 0.5 * Math.cos(2 * Math.PI * p2);
+      out[i] = this.read(this.w - this.ph * N) * g1 + this.read(this.w - p2 * N) * g2;
+      this.w = (this.w + 1) % N;
+    }
+    for (let c = 1; c < outputs[0].length; c++) outputs[0][c].set(out);
+    return true;
+  }
+}
+registerProcessor('pitch-shifter', PitchShifter);`;
+
 /* ───────────── progress loader ───────────── */
 /**
  * Ring loader with a percentage, a running mm:ss timer and a stage label, rendered into `el`.
@@ -532,7 +632,14 @@ const top = (title, back = true) => `<div class="top">${back ? `<button class="i
 const ddHtml = (id, groups, sel) => {
   const flat = groups.flatMap(g => g.items), cur = flat.find(o => o.value === sel) || flat[0];
   return `<div class="dd" id="${id}" data-value="${esc(cur.value)}"><button type="button" class="field dd-btn" aria-haspopup="listbox" aria-expanded="false"><span class="dd-label">${esc(cur.label)}${cur.sub ? `<small>${esc(cur.sub)}</small>` : ''}</span><span class="dd-caret">${icon('chev')}</span></button>
-    <ul class="dd-list" role="listbox" hidden>${groups.map(g => (g.title ? `<li class="dd-group" role="presentation">${esc(g.title)}</li>` : '') + g.items.map(o => `<li role="option" tabindex="-1" data-v="${esc(o.value)}" aria-selected="${o.value === cur.value}"><span>${esc(o.label)}</span>${o.sub ? `<small>${esc(o.sub)}</small>` : ''}</li>`).join('')).join('')}</ul></div>`;
+    <ul class="dd-list" role="listbox" hidden>${groups.map(g => (g.title ? `<li class="dd-group" role="presentation">${esc(g.title)}</li>` : '') + g.items.map(o => {
+      const text = `<span>${esc(o.label)}</span>${o.sub ? `<small>${esc(o.sub)}</small>` : ''}`;
+      return o.acts
+        ? `<li role="option" tabindex="-1" class="has-acts" data-v="${esc(o.value)}" aria-selected="${o.value === cur.value}"><span class="dd-text">${text}</span><span class="dd-acts">
+            <button type="button" class="dd-act" data-prev="${esc(o.value)}" tabindex="-1" aria-label="Preview ${esc(o.label)}">▶</button>
+            <button type="button" class="dd-act star" data-fav="${esc(o.value)}" tabindex="-1" aria-pressed="${!!o.fav}" aria-label="Favourite ${esc(o.label)}">★</button></span></li>`
+        : `<li role="option" tabindex="-1" data-v="${esc(o.value)}" aria-selected="${o.value === cur.value}">${text}</li>`;
+    }).join('')).join('')}</ul></div>`;
 };
 function bindDropdowns(root) {
   $$('.dd', root).forEach(dd => {
@@ -541,10 +648,10 @@ function bindDropdowns(root) {
     const close = () => { list.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
     const open = () => { $$('.dd-list').forEach(l => { l.hidden = true; }); list.hidden = false; btn.setAttribute('aria-expanded', 'true');
       const s = $('[aria-selected=true]', dd); s?.scrollIntoView({ block: 'nearest' }); s?.focus(); };
-    const pick = o => { dd.dataset.value = o.dataset.v; opts.forEach(x => x.setAttribute('aria-selected', x === o));
-      $('.dd-label', dd).innerHTML = o.innerHTML; close(); btn.focus(); dd.dispatchEvent(new Event('change')); };
+    const pick = o => { dd.dataset.value = o.dataset.v; opts.forEach(x => x.setAttribute('aria-selected', x.dataset.v === o.dataset.v));
+      $('.dd-label', dd).innerHTML = ($('.dd-text', o) || o).innerHTML; close(); btn.focus(); dd.dispatchEvent(new Event('change')); };
     btn.onclick = () => list.hidden ? open() : close();
-    opts.forEach(o => { o.onclick = () => pick(o);
+    opts.forEach(o => { o.onclick = e => { if (!e.target.closest('.dd-act')) pick(o); };
       o.onkeydown = e => { const i = opts.indexOf(o);
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(o); }
         else if (e.key === 'ArrowDown') { e.preventDefault(); opts[Math.min(i + 1, opts.length - 1)].focus(); }
@@ -559,12 +666,101 @@ const baseVoiceDropdown = (id, sel) => {
   return ddHtml(id, [{ items: [{ value: '', label: 'Automatic', sub: 'device voice matching male/female' }] }, ...(dev.length ? [{ title: 'Device voices', items: dev }] : [])], sel);
 };
 const voiceItem = v => ({ value: v.id, label: v.name, sub: `${v.gender && v.el ? v.gender + ' • ' : ''}${v.cat}${v.pitch ? ` • ${v.pitch} Hz` : ''}${v.fx ? ` • ${v.fx}` : ''}` });
+/* Favourite and recently used voices (per browser). */
+const favSet = () => new Set(ls.get('favvoices', []));
+const toggleFav = id => { const f = favSet(); f.has(id) ? f.delete(id) : f.add(id); ls.set('favvoices', [...f]); return f.has(id); };
+const noteVoiceUsed = id => ls.set('recentvoices', [id, ...ls.get('recentvoices', []).filter(x => x !== id)].slice(0, 5));
+/** Plays a short preview of any voice: its own sample, its ElevenLabs preview, a stand-in's preview, or the device voice. */
+async function previewVoice(v, btn) {
+  if (!v) return;
+  if (btn.classList.contains('playing') && S.stopPlayback) return S.stopPlayback();
+  if (S.stopPlayback) S.stopPlayback();
+  let src;
+  const sample = !v.preset && !v.el ? await blobs.get('sample:' + v.id) : null;
+  if (sample) src = bufferSource(await decode(sample));
+  else if (v.preview) src = urlSource(v.preview);
+  else { const si = cloud.hosted && !v.remote ? elVoiceFor(isMale(v), v.cat === 'Hindi') : null; src = si?.preview ? urlSource(si.preview) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1); }
+  const label = btn.innerHTML; btn.classList.add('playing'); btn.innerHTML = '■';
+  const reset = () => { btn.classList.remove('playing'); btn.innerHTML = label; S.stopPlayback = null; };
+  const stop = src.play(reset); S.stopPlayback = () => { stop(); reset(); };
+}
+// Star / preview buttons anywhere (dropdowns, library); capture phase so they never select the dropdown option.
+document.addEventListener('click', e => {
+  const fav = e.target.closest('[data-fav]'), prev = e.target.closest('[data-prev]');
+  if (fav) { e.stopPropagation(); const on = toggleFav(fav.dataset.fav); $$('[data-fav]').forEach(b => { if (b.dataset.fav === fav.dataset.fav) b.setAttribute('aria-pressed', on); }); toast(on ? '★ Added to favourites' : 'Removed from favourites'); }
+  else if (prev) { e.stopPropagation(); previewVoice(findVoice(prev.dataset.prev), prev); }
+}, true);
 const voiceDropdown = (id, sel) => {
+  const favs = favSet(), item = v => ({ ...voiceItem(v), acts: true, fav: favs.has(v.id) });
+  const fav = [...favs].map(findVoice).filter(Boolean), recent = ls.get('recentvoices', []).map(findVoice).filter(v => v && !favs.has(v.id));
   const hi = S.elVoices.filter(v => v.lang === 'hi'), other = S.elVoices.filter(v => v.lang !== 'hi');
-  return ddHtml(id, [...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(voiceItem) }] : []),
-    ...(hi.length ? [{ title: 'ElevenLabs · Hindi', items: hi.map(voiceItem) }] : []), ...(other.length ? [{ title: 'ElevenLabs voices', items: other.map(voiceItem) }] : []),
-    { title: 'Preset voices', items: PRESETS.map(voiceItem) }], sel);
+  return ddHtml(id, [...(fav.length ? [{ title: '★ Favourites', items: fav.map(item) }] : []), ...(recent.length ? [{ title: 'Recently used', items: recent.map(item) }] : []),
+    ...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(item) }] : []),
+    ...(hi.length ? [{ title: 'ElevenLabs · Hindi', items: hi.map(item) }] : []), ...(other.length ? [{ title: 'ElevenLabs voices', items: other.map(item) }] : []),
+    { title: 'Preset voices', items: PRESETS.map(item) }], sel);
 };
+
+/* Templates and tips. */
+const TEMPLATES = [
+  { emoji: '🎂', title: 'Birthday wish', male: false, vs: { style: .4 }, text: '[excited] Happy birthday! [pause 0.5s] Wishing you a year full of laughter, adventure and cake. [laughs] Lots and lots of cake!' },
+  { emoji: '📣', title: 'Product ad', male: true, vs: { style: .5, speed: 1.05 }, text: '[excited] Introducing JoloVocals – [pause 0.5s] the studio that turns your words into real voices. Try it free today!' },
+  { emoji: '🌙', title: 'Bedtime story', male: false, vs: { stability: .8, speed: .9 }, text: '[calm] Once upon a time, in a quiet village by the sea, [pause 1s] there lived a little lighthouse that was afraid of the dark…' },
+  { emoji: '🙏', title: 'Hindi greeting', male: true, hindi: true, vs: {}, text: 'नमस्ते! [pause 0.5s] JoloVocals में आपका स्वागत है। आज हम आपकी आवाज़ को एक नया रूप देंगे।' },
+  { emoji: '🎙️', title: 'Podcast intro', male: true, vs: { style: .3 }, text: 'Welcome back to the show! [pause 0.5s] I’m your host, and today we’re diving into something [excited] really exciting.' },
+  { emoji: '💪', title: 'Motivation', male: true, vs: { stability: .75 }, text: '[calm] Every expert was once a beginner. [pause 1s] Start small, stay consistent, and never stop learning.' },
+  { emoji: '🇮🇳', title: 'Hindi quote', male: false, hindi: true, vs: { stability: .75 }, text: '[calm] सपने वो नहीं जो हम सोते हुए देखते हैं, [pause 0.5s] सपने वो हैं जो हमें सोने नहीं देते।' },
+  { emoji: '📞', title: 'Phone menu', male: false, vs: { stability: .9 }, text: 'Thank you for calling. [pause 0.5s] For billing, press one. For technical support, press two. [pause 0.5s] Your call is important to us.' },
+  { emoji: '🍕', title: 'Funny announcement', male: true, vs: { style: .6 }, text: 'Attention please! [pause 0.5s] The last slice of pizza has been spotted in the kitchen. [laughs] May the fastest one win!' },
+  { emoji: '🎉', title: 'Big news', male: false, vs: { style: .6 }, text: '[excited] Guess what? [pause 0.5s] We did it! [laughs] The project is finally live!' },
+  { emoji: '🤫', title: 'Whispered secret', male: false, vs: {}, text: '[whispers] Can you keep a secret? [pause 1s] The treasure is hidden under the old oak tree.' },
+];
+const TIPS = [
+  'Add <b>[laughs]</b> or <b>[whispers]</b> to your text for expressive speech.',
+  'Try the <a href="#/live">Live Voice Changer</a> – talk and hear yourself as a robot.',
+  'Tap ★ next to a voice to keep it at the top of the list.',
+  'Use <b>[pause 1s]</b> for a dramatic pause.',
+  'Add an echo or stadium effect to any converted audio.',
+  'Reuse anything from <a href="#/history">History</a> to edit and regenerate it.',
+];
+/** Loads a template into Text to Voice: text, a fitting voice and suggested settings. */
+function applyTemplate(t) {
+  const v = (cloud.hosted && elVoiceFor(t.male, !!t.hindi)) || findVoice(t.hindi ? (t.male ? 'pre-anchor' : 'pre-narrator') : (t.male ? 'pre-man' : 'pre-woman'));
+  S.tts.text = t.text; if (v) S.tts.voiceId = v.id;
+  S.vs = { ...VS_DEFAULTS, ...t.vs }; saveVs();
+  toast(`${t.emoji} ${t.title} loaded – edit it or tap Generate`);
+}
+const templateCards = () => TEMPLATES.map((t, i) => `<button type="button" class="tpl" data-tpl="${i}"><span class="tpl-emoji">${t.emoji}</span><strong>${t.title}</strong><small>${esc(stripTags(t.text).slice(0, 48))}…</small></button>`).join('');
+
+/* Usage dashboard: ElevenLabs credits plus streak/week stats from history (or local recents). */
+const dayKey = t => { const d = new Date(t); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
+function usageStats(times) {
+  const days = new Set(times.map(dayKey)), now = Date.now();
+  let streak = 0, t = now; if (!days.has(dayKey(t))) t -= 864e5;
+  while (days.has(dayKey(t))) { streak++; t -= 864e5; }
+  return { streak, week: times.filter(x => now - x < 7 * 864e5).length, total: times.length };
+}
+async function loadUsage(el) {
+  const now = Date.now();
+  if (cloud.hosted && (!S.usageCache || now - S.usageCache.t > 60000)) {
+    const [u, d] = await Promise.all([cloud.usage().catch(() => null), cloud.historyDates().catch(() => null)]);
+    S.usageCache = { t: now, u, d };
+  }
+  const u = cloud.hosted ? S.usageCache?.u : null, times = (cloud.hosted && S.usageCache?.d) || S.recents.map(x => x.ts).filter(x => now - x < 90 * 864e5);
+  const st = usageStats(times);
+  if (!el.isConnected) return;
+  const left = u && u.limit ? Math.max(0, u.limit - u.used) : null, pct = left === null ? 0 : Math.round(left / u.limit * 100);
+  const reset = u?.resetUnix ? new Date(u.resetUnix * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
+  el.classList.toggle('low', left !== null && pct < 10);
+  el.innerHTML = `${left !== null ? `<div class="u-row"><strong>Voice credits</strong><span><b>${left.toLocaleString()}</b> of ${u.limit.toLocaleString()} left</span></div>
+      <div class="bar"><i style="width:${pct}%"></i></div><small class="muted">${u.tier ? esc(String(u.tier)).replace(/^./, c => c.toUpperCase()) + ' plan' : ''}${reset ? ` · resets ${reset}` : ''}${pct < 10 ? ' · running low' : ''}</small>` : ''}
+    <div class="u-stats"><div><b>🔥 ${st.streak}</b><small>day streak</small></div><div><b>${st.week}</b><small>this week</small></div><div><b>${st.total}</b><small>last 90 days</small></div></div>`;
+}
+
+/* Installable app (PWA). */
+let installEvt = null;
+const installHtml = cls => `<button type="button" class="${cls}" data-install ${installEvt ? '' : 'hidden'}>⬇ Install app</button>`;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; $$('[data-install]').forEach(b => { b.hidden = false; }); });
+window.addEventListener('appinstalled', () => { installEvt = null; $$('[data-install]').forEach(b => { b.hidden = true; }); toast('JoloVocals installed'); });
 const go = r => { location.hash = '#/' + r; };
 
 const V = {};
@@ -616,16 +812,23 @@ V.login = () => {
 };
 
 V.home = () => {
-  const items = S.recents.slice(0, 3);
-  return { html: `<section class="screen has-nav"><div class="top"><div class="brand" style="font-size:24px;flex:1">Jolo<b>Vocals</b> <span class="pro">Pro</span></div></div>
-    <div class="hello">Hello, ${esc(S.user.name)} 👋</div><p class="muted">What would you like to do today?</p>
-    <div class="menu">${[['tts', 'text', 'Text to Voice', 'Use your cloned voice'], ['v2v', 'wave', 'Voice to Voice', 'Convert your audio'],
+  const items = S.recents.slice(0, 3), tip = TIPS[Math.floor(Math.random() * TIPS.length)];
+  return { html: `<section class="screen has-nav"><div class="top"><div class="brand" style="font-size:24px;flex:1">Jolo<b>Vocals</b> <span class="pro">Pro</span></div>${installHtml('install-chip')}</div>
+    <div class="hello">Hello, ${esc(S.user.name)} 👋</div><p class="muted tip">💡 ${tip}</p>
+    <button type="button" class="ucard" id="usage" ${cloud.hosted ? 'data-go="history"' : ''} aria-label="Your usage"><div class="u-stats"><div><b>…</b><small>loading</small></div></div></button>
+    <button class="mcard live-card" data-go="live"><span class="ic">${icon('mic')}</span><span class="grow"><strong>Live Voice Changer</strong><small>Talk and hear yourself as a robot, monster, alien…</small></span>${icon('arrow')}</button>
+    <div class="menu">${[['tts', 'text', 'Text to Voice', 'Type it, hear it in any voice'], ['v2v', 'wave', 'Voice to Voice', 'Convert your audio'],
       ['create', 'adduser', 'Create Voice', 'Clone a new voice'], ['library', 'lib', 'Voice Library', 'Manage your voices']]
       .map(([r, ic, t, s]) => `<button class="mcard" data-go="${r}"><span class="ic">${icon(ic)}</span><span class="grow"><strong>${t}</strong><small>${s}</small></span>${icon('arrow')}</button>`).join('')}</div>
+    <div class="sec"><span>Try a template</span></div><div class="tpl-row">${templateCards()}</div>
     <div class="sec"><span>Recent Audios</span>${cloud.hosted ? '<a href="#/history">See all history</a>' : ''}</div>
     ${items.length ? items.map(a => `<div class="row" data-recent="${a.id}" style="cursor:pointer"><span class="play">${icon('play')}</span><div class="info"><strong>${esc(a.title)}</strong><small>${ago(a.ts)} • ${fmt(a.dur)}</small></div></div>`).join('')
       : '<div class="empty">Nothing yet – generate some speech or convert a voice.</div>'}${nav('home')}</section>`,
-  bind: r => $$('[data-recent]', r).forEach(el => el.onclick = () => openRecent(el.dataset.recent)) };
+  bind: r => {
+    $$('[data-recent]', r).forEach(el => el.onclick = () => openRecent(el.dataset.recent));
+    $$('[data-tpl]', r).forEach(b => b.onclick = () => { applyTemplate(TEMPLATES[+b.dataset.tpl]); go('tts'); });
+    loadUsage($('#usage', r));
+  } };
 };
 
 async function openRecent(id) {
@@ -713,15 +916,17 @@ V.created = () => ({
 
 V.library = () => ({
   html: `<section class="screen has-nav">${top('Voice Library')}<div class="search"><input class="field" id="q" placeholder="Search voices…" value="${esc(S.libQuery)}"></div>
-    <div class="seg"><button data-t="mine" class="${S.libTab === 'mine' ? 'on' : ''}">My Voices</button><button data-t="shared" class="${S.libTab === 'shared' ? 'on' : ''}">Shared</button></div>
+    <div class="seg seg3"><button data-t="mine" class="${S.libTab === 'mine' ? 'on' : ''}">My Voices</button><button data-t="fav" class="${S.libTab === 'fav' ? 'on' : ''}">★ Favourites</button><button data-t="shared" class="${S.libTab === 'shared' ? 'on' : ''}">Shared</button></div>
     <div id="list"></div><div class="grow"></div><button class="btn" data-go="create">${icon('plus')} Create New Voice</button>${nav('library')}</section>`,
   bind: r => {
     const draw = () => {
-      const list = (S.libTab === 'mine' ? S.voices : [...S.elVoices, ...PRESETS]).filter(v => v.name.toLowerCase().includes(S.libQuery.toLowerCase()));
+      const favs = favSet(), pool = S.libTab === 'mine' ? S.voices : S.libTab === 'fav' ? [...favs].map(findVoice).filter(Boolean) : [...S.elVoices, ...PRESETS];
+      const list = pool.filter(v => v.name.toLowerCase().includes(S.libQuery.toLowerCase()));
       $('#list', r).innerHTML = list.length ? list.map(v => `<div class="row" data-id="${v.id}"><button class="play" data-play>${icon('play')}</button>
         <div class="info"><strong>${esc(v.name)}</strong><small>${esc(v.cat)}${v.el ? '' : ` • ${Math.max(1, Math.round(v.dur / 60))} min`}${v.pitch ? ` • ${v.pitch} Hz` : ''}</small></div>
+        <button class="icon-btn star" data-fav="${v.id}" aria-pressed="${favs.has(v.id)}" aria-label="Favourite ${esc(v.name)}">★</button>
         ${v.preset ? '' : '<button class="menu-btn" data-menu aria-label="Voice options">⋮</button>'}</div>`).join('')
-        : `<div class="empty">${S.libTab === 'mine' ? 'No voices yet – create your first one.' : 'No matching voices.'}</div>`;
+        : `<div class="empty">${S.libTab === 'mine' ? 'No voices yet – create your first one.' : S.libTab === 'fav' ? 'No favourites yet – tap ★ on any voice.' : 'No matching voices.'}</div>`;
       $$('[data-play]', r).forEach(b => b.onclick = async () => {
         const v = findVoice(b.closest('.row').dataset.id); if (S.stopPlayback) S.stopPlayback();
         const sample = v.preset ? null : await blobs.get('sample:' + v.id), src = sample ? bufferSource(await decode(sample)) : v.preview ? urlSource(v.preview) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1);
@@ -745,7 +950,8 @@ V.tts = () => {
   return { html: `<section class="screen has-nav">${top('Text to Voice')}
     <label class="lbl" style="margin-top:0">Select Voice</label>${voiceDropdown('v', t.voiceId)}
     <label class="lbl">Offline voice <span class="muted" style="font-weight:400">– used only when ElevenLabs is unavailable</span></label>${baseVoiceDropdown('sys', t.sysVoice)}
-    <label class="lbl">Enter Text</label>
+    <div class="lbl-row"><label class="lbl">Enter Text</label><button type="button" class="tag tpl-open" id="tpl-open">✨ Templates</button></div>
+    <div class="overlay" id="tpl-sheet" hidden><div class="ov-card sheet" role="dialog" aria-label="Templates"><h3 class="center">Templates</h3><div class="tpl-list">${templateCards()}</div><button class="btn ghost" id="tpl-close">Close</button></div></div>
     <div class="tags" aria-label="Insert a tag">${TAG_GROUPS.map(([g, tags]) => `<div class="tag-row"><span class="muted">${g}</span>${tags.map(x => `<button type="button" class="tag" data-tag="${x}">${x}</button>`).join('')}</div>`).join('')}</div>
     <textarea class="field" id="txt" maxlength="5000" placeholder="Type what the voice should say…">${esc(t.text)}</textarea>
     <div class="muted" style="display:flex;justify-content:space-between;font-size:12px"><span>Tags are performed by ElevenLabs voices; other voices keep pauses and skip the rest.</span><span style="white-space:nowrap;margin-left:8px"><span id="cnt">${t.text.length}</span>/5000</span></div>
@@ -765,8 +971,14 @@ V.tts = () => {
       ta.dispatchEvent(new Event('input'));
     });
     bindSettings(r);
+    const sheet = $('#tpl-sheet', r);
+    $('#tpl-open', r).onclick = () => { sheet.hidden = false; };
+    $('#tpl-close', r).onclick = () => { sheet.hidden = true; };
+    sheet.onclick = e => { if (e.target === sheet) sheet.hidden = true; };
+    $$('[data-tpl]', r).forEach(b => b.onclick = () => { applyTemplate(TEMPLATES[+b.dataset.tpl]); render(); setTimeout(() => $('#txt')?.focus(), 50); });
     $('#gen', r).onclick = () => {
       if (!t.text.trim()) return toast('Enter some text first');
+      noteVoiceUsed(t.voiceId);
       const id = uid(); S.ttsResult = { text: t.text, voiceId: t.voiceId, id, fresh: true }; go('tts-result');
     };
   } };
@@ -800,13 +1012,18 @@ V['tts-result'] = () => {
     if (buf && !res.buf) { pl.set(98, 'Applying settings…'); await sleep(20); const c = applyControls(buf); if (c) { buf = c; blob = encodeWav(mono(c), c.sampleRate); } }
     if (buf && !res.buf) { pl.done(); await sleep(350); } else pl.stop();
     if (gone()) return;
-    const src = device ? speakSource(res.text, v, S.vs.stability, S.vs.similarity, S.tts.sysVoice, S.vs) : bufferSource(buf);
+    const src = device ? speakSource(res.text, v, S.vs.stability, S.vs.similarity, S.tts.sysVoice, S.vs) : bufferSource(buf), dry = { buf, blob };
     body.innerHTML = `<div class="player">${playerHtml(device ? fakePeaks(res.text.length) : peaks(buf), src.duration, true)}</div>
+      ${device ? '' : fxRowHtml('none')}
       <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${standIn && buf ? ` (ElevenLabs ${esc(standIn.name.split(' - ')[0])})` : ''}${device ? ' (device voice)' : ''}</p>
       <div class="actions"><button class="act" id="dl" ${device ? 'disabled' : ''}>${icon('download')}Download</button>
         <button class="act" id="sh">${icon('share')}Share</button><button class="act del" id="rm">${icon('trash')}Delete</button></div>
       <button class="btn" id="again">Generate Again</button>`;
-    const p = bindPlayer($('.player', r), async () => src);
+    let p = bindPlayer($('.player', r), async () => device ? src : bufferSource(buf));
+    if (!device) bindFxRow(r, async fx => {
+      p(); if (fx.id === 'none') ({ buf, blob } = dry); else { buf = await renderFx(dry.buf, fx); blob = encodeWav(mono(buf), buf.sampleRate); }
+      const pl = $('.player', r); pl.innerHTML = playerHtml(peaks(buf), buf.duration, true); p = bindPlayer(pl, async () => bufferSource(buf)); $('.play', pl).click();
+    });
     if (res.fresh) { res.fresh = false; const item = { id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); if (blob) blobs.put('audio:' + res.id, blob); }
     setTimeout(() => $('.play', r)?.click(), 250);
     $('#again', r).onclick = () => { if (device) { p(); $('.play', r).click(); } else { res.buf = res.blob = null; res.fresh = false; render(); } };
@@ -835,7 +1052,7 @@ V.v2v = () => {
     bindSettings(r);
     $('#conv', r).onclick = async () => {
       const btn = $('#conv', r), voice = findVoice(st.voiceId), ov = $('#conv-ov', r), ctl = {}; let cancelled = false;
-      btn.disabled = true; stopRec(); ov.hidden = false;
+      btn.disabled = true; stopRec(); ov.hidden = false; noteVoiceUsed(voice.id);
       const pl = progressLoader($('#conv-pl', r)), step = async (p, label) => { pl.set(p, label, true); await sleep(50); if (cancelled) throw new Error('cancelled'); };
       const restore = () => { pl.stop(); ov.hidden = true; btn.disabled = false; };
       $('#conv-cancel', r).onclick = () => { cancelled = true; ctl.abort?.(); restore(); toast('Conversion cancelled'); };
@@ -875,6 +1092,7 @@ V['v2v-result'] = () => {
   return { html: `<section class="screen">${top('Converted Audio')}
     <div class="seg"><button data-w="original" ${res.original ? '' : 'disabled'}>Original</button><button data-w="converted" class="on">Converted</button></div>
     <div class="player" id="pl"></div>
+    ${fxRowHtml(res.fx || 'none')}
     <div class="actions"><button class="act" id="dl">${icon('download')}Download</button><button class="act" id="sh">${icon('share')}Share</button><button class="act del" id="rm">${icon('trash')}Delete</button></div>
     <div class="grow"></div><button class="btn" id="more">${icon('wave')} Convert Another</button></section>`,
   bind: r => {
@@ -882,11 +1100,108 @@ V['v2v-result'] = () => {
     const draw = () => { const buf = res[which]; $('#pl', r).innerHTML = playerHtml(peaks(buf), buf.duration, true); halt = bindPlayer($('#pl', r), async () => bufferSource(res[which])); };
     draw();
     $$('.seg button', r).forEach(b => b.onclick = () => { if (b.disabled) return; halt(); which = b.dataset.w; $$('.seg button', r).forEach(x => x.classList.toggle('on', x === b)); draw(); });
+    res.dry = res.dry || { buf: res.converted, blob: res.blob };   // effects always start from the unprocessed result
+    bindFxRow(r, async p => {
+      halt(); res.fx = p.id;
+      if (p.id === 'none') { res.converted = res.dry.buf; res.blob = res.dry.blob; }
+      else { const out = await renderFx(res.dry.buf, p); res.converted = out; res.blob = encodeWav(mono(out), out.sampleRate); }
+      which = 'converted'; $$('.seg button', r).forEach(x => x.classList.toggle('on', x.dataset.w === 'converted')); draw(); $('.play', r).click();
+    });
     $('#dl', r).onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(res.blob); a.download = `jolovocals-${res.id}.${res.blob.type.includes('mpeg') ? 'mp3' : 'wav'}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
     $('#sh', r).onclick = async () => { const f = new File([res.blob], 'jolovocals.wav', { type: 'audio/wav' });
       if (navigator.canShare?.({ files: [f] })) navigator.share({ files: [f] }).catch(() => {}); else toast('Sharing files isn’t supported here – use Download'); };
     $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); blobs.del('audio:' + res.id); S.v2vResult = null; go('v2v'); };
     $('#more', r).onclick = () => { S.v2v.sample = null; go('v2v'); };
+  } };
+};
+
+/* Live voice changer: mic → pitch worklet → effect chain → speakers (+ recorder). */
+V.live = () => {
+  const L = S.live;
+  return { html: `<section class="screen has-nav">${top('Live Voice Changer')}
+    <p class="muted center">Talk and hear yourself transformed in real time. 🎧 Use headphones to avoid feedback.</p>
+    <button class="livebtn" id="live-toggle" aria-pressed="false" aria-label="Start live voice">${icon('mic')}<span>Start</span></button>
+    <div class="meter" aria-hidden="true"><i id="lvl"></i></div>
+    <p class="center muted" id="live-status">Microphone is off</p>
+    <div class="fxgrid" role="group" aria-label="Voice effect">${FX_PRESETS.map(p => `<button type="button" class="fxcard ${p.id === L.preset ? 'on' : ''}" data-live="${p.id}"><span>${p.emoji}</span>${p.name}</button>`).join('')}</div>
+    <details class="vs" open><summary>Fine-tune</summary>
+      <div class="slider"><span>Pitch</span><input type="range" id="lv-pitch" min="-12" max="12" step="1" value="${L.pitch}" aria-label="Pitch"><b id="lv-pitch-v">${L.pitch > 0 ? '+' : ''}${L.pitch} st</b></div>
+      <div class="slider"><span>Echo</span><input type="range" id="lv-echo" min="0" max="0.8" step="0.05" value="${L.echo}" aria-label="Echo"><b id="lv-echo-v">${Math.round(L.echo * 100)}%</b></div>
+      <div class="slider"><span>Reverb</span><input type="range" id="lv-reverb" min="0" max="1" step="0.05" value="${L.reverb}" aria-label="Reverb"><b id="lv-reverb-v">${Math.round(L.reverb * 100)}%</b></div>
+      <label class="check" style="margin:8px 0"><input type="checkbox" id="lv-monitor" ${L.monitor ? 'checked' : ''}><span>Hear myself <span class="muted">– turn off to record silently</span></span></label>
+    </details>
+    <div class="grow"></div><button class="btn" id="live-rec" disabled>${icon('mic')} Record</button>${nav('live')}</section>`,
+  bind: r => {
+    let ctx = null, stream = null, src = null, shifter = null, chainOut = null, outGain = null, analyser = null, recDest = null, rec = null, chunks = [], recT0 = 0, raf = 0, tick = 0;
+    const status = t => { $('#live-status', r).textContent = t; };
+    const fx = () => ({ ...fxPreset(L.preset), echo: L.echo, reverb: L.reverb });
+    const save = () => ls.set('live', L);
+    const rewire = () => {   // (re)build the effect chain after a preset or mix change
+      if (!ctx) return;
+      const head = shifter || src;
+      try { head.disconnect(); } catch { /* not connected yet */ }
+      if (chainOut) try { chainOut.disconnect(); } catch { /* already gone */ }
+      chainOut = buildFxChain(ctx, fx(), head); chainOut.connect(outGain);
+      if (shifter) shifter.parameters.get('ratio').value = 2 ** (L.pitch / 12);
+    };
+    const stop = () => {
+      cancelAnimationFrame(raf); clearInterval(tick);
+      if (rec && rec.state !== 'inactive') rec.stop();
+      stream?.getTracks().forEach(t => t.stop()); ctx?.close().catch(() => {});
+      ctx = stream = src = shifter = chainOut = outGain = analyser = recDest = null;
+      const b = $('#live-toggle', r); if (b) { b.classList.remove('on'); b.setAttribute('aria-pressed', 'false'); $('span', b).textContent = 'Start'; $('#live-rec', r).disabled = true; status('Microphone is off'); $('#lvl', r).style.width = '0'; }
+    };
+    const start = async () => {
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } }); }
+      catch { return toast('Microphone unavailable – allow access to use the live voice changer'); }
+      ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+      src = ctx.createMediaStreamSource(stream);
+      try {
+        await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([PITCH_WORKLET], { type: 'application/javascript' })));
+        shifter = new AudioWorkletNode(ctx, 'pitch-shifter'); src.connect(shifter);
+      } catch (e) { console.warn('[live] pitch shifting unavailable', e); shifter = null; toast('Pitch shifting isn’t supported in this browser – other effects still work'); }
+      outGain = ctx.createGain(); analyser = ctx.createAnalyser(); analyser.fftSize = 1024; recDest = ctx.createMediaStreamDestination();
+      outGain.connect(analyser); outGain.connect(recDest); if (L.monitor) outGain.connect(ctx.destination);
+      rewire();
+      const lvl = $('#lvl', r), data = new Float32Array(analyser.fftSize);
+      const draw = () => { if (!analyser) return; analyser.getFloatTimeDomainData(data); let s = 0; for (const x of data) s += x * x; lvl.style.width = Math.min(100, Math.sqrt(s / data.length) * 400) + '%'; raf = requestAnimationFrame(draw); };
+      draw();
+      const b = $('#live-toggle', r); b.classList.add('on'); b.setAttribute('aria-pressed', 'true'); $('span', b).textContent = 'Stop'; $('#live-rec', r).disabled = false;
+      status(`Live · ${fxPreset(L.preset).name}`);
+    };
+    $('#live-toggle', r).onclick = () => ctx ? stop() : start();
+    $$('[data-live]', r).forEach(b => b.onclick = () => {
+      const p = fxPreset(b.dataset.live); L.preset = p.id; L.pitch = p.pitch || 0; L.echo = p.echo || 0; L.reverb = p.reverb || 0; save();
+      $$('[data-live]', r).forEach(x => x.classList.toggle('on', x === b));
+      $('#lv-pitch', r).value = L.pitch; $('#lv-echo', r).value = L.echo; $('#lv-reverb', r).value = L.reverb;
+      $('#lv-pitch-v', r).textContent = `${L.pitch > 0 ? '+' : ''}${L.pitch} st`; $('#lv-echo-v', r).textContent = Math.round(L.echo * 100) + '%'; $('#lv-reverb-v', r).textContent = Math.round(L.reverb * 100) + '%';
+      rewire(); if (ctx) status(`Live · ${p.name}`);
+    });
+    [['pitch', v => `${v > 0 ? '+' : ''}${v} st`], ['echo', v => Math.round(v * 100) + '%'], ['reverb', v => Math.round(v * 100) + '%']].forEach(([k, show]) =>
+      $('#lv-' + k, r).oninput = e => { L[k] = +e.target.value; $(`#lv-${k}-v`, r).textContent = show(L[k]); save(); if (k === 'pitch') { if (shifter) shifter.parameters.get('ratio').value = 2 ** (L.pitch / 12); } else rewire(); });
+    $('#lv-monitor', r).onchange = e => { L.monitor = e.target.checked; save(); if (outGain) { try { outGain.disconnect(ctx.destination); } catch { /* wasn't connected */ } if (L.monitor) outGain.connect(ctx.destination); } };
+    $('#live-rec', r).onclick = () => {
+      const btn = $('#live-rec', r);
+      if (rec && rec.state === 'recording') { rec.stop(); return; }
+      chunks = []; rec = new MediaRecorder(recDest.stream); rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+      rec.onstop = async () => {
+        clearInterval(tick); btn.innerHTML = `${icon('mic')} Record`; btn.classList.remove('rec-on');
+        if (!chunks.length) return;
+        try {
+          const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' }), buf = await decode(blob);
+          if (buf.duration < .5) return toast('Recording too short');
+          const wav = encodeWav(mono(buf), buf.sampleRate), id = uid(), name = fxPreset(L.preset).name;
+          await blobs.put('audio:' + id, wav);
+          S.v2vResult = { id, original: null, converted: buf, blob: wav, voice: `Live · ${name}` };
+          const item = { id, kind: 'v2v', title: `Live · ${name}`, ts: Date.now(), dur: buf.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item);
+          go('v2v-result');
+        } catch (e) { console.error(e); toast('Couldn’t save the recording'); }
+      };
+      rec.start(); recT0 = Date.now(); btn.classList.add('rec-on');
+      tick = setInterval(() => { btn.innerHTML = `■ Stop recording · ${fmt(Math.floor((Date.now() - recT0) / 1000))}`; }, 250);
+      btn.innerHTML = '■ Stop recording · 00:00';
+    };
+    r._cleanup = stop;
   } };
 };
 
@@ -960,6 +1275,8 @@ V.profile = () => ({
     <h2>${esc(S.user.name)}</h2><p class="muted">${esc(S.user.id)}</p><p class="muted">${cloud.on ? '☁ Synced to your account' : 'Stored on this device only'}</p></div><div class="gap"></div>
     <div class="card"><strong>${S.voices.length}</strong> custom voice${S.voices.length === 1 ? '' : 's'} saved on this device</div>
     ${cloud.hosted ? `<div class="gap"></div><button class="btn ghost" data-go="history">${icon('lib')} Generation history</button>` : ''}
+    <div class="gap"></div>${installHtml('btn ghost')}
+    ${/iphone|ipad|ipod/i.test(navigator.userAgent) && !navigator.standalone ? '<p class="muted center" style="margin-top:10px">On iPhone: tap Share → <b>Add to Home Screen</b> to install.</p>' : ''}
     <div class="grow"></div><button class="btn outline" id="out">Sign out</button><div class="gap"></div><button class="btn outline" id="wipe" style="color:var(--red)">Delete all local data</button>${nav('profile')}</section>`,
   bind: r => {
     $('#out', r).onclick = async () => { await cloud.signOut(); S.user = null; S.elVoices = []; ls.set('user', null); ls.set('elvoices', []); go('login'); };
@@ -979,10 +1296,12 @@ function render() {
   const view = V[name](); app.innerHTML = view.html; app._cleanup = null;
   $$('[data-go]', app).forEach(b => b.onclick = () => go(b.dataset.go));
   $$('[data-back]', app).forEach(b => b.onclick = () => history.length > 1 ? history.back() : go('home'));
+  $$('[data-install]', app).forEach(b => b.onclick = async () => { if (!installEvt) return; installEvt.prompt(); await installEvt.userChoice.catch(() => {}); installEvt = null; $$('[data-install]').forEach(x => { x.hidden = true; }); });
   bindDropdowns(app); const c = view.bind(app); app.scrollTo?.(0, 0); window.scrollTo(0, 0);
   if (c && c.catch) c.catch(console.error);
 }
 window.addEventListener('hashchange', render);
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(e => console.warn('[sw]', e));
 speechSynthesis?.getVoices();
 (async () => {
   if (cloud.on) {

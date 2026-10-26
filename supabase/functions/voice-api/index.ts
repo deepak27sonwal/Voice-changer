@@ -1,5 +1,5 @@
 // JoloVocals hosted voice API: a thin, authenticated proxy to ElevenLabs so the API key never reaches the browser.
-// Routes (POST, signed-in users only): /voices, /clone, /tts, /sts, /delete, /history-delete
+// Routes (POST, signed-in users only): /voices, /usage, /clone, /tts, /sts, /delete, /history-delete
 // Single file so it can be pasted straight into the Supabase dashboard editor. Function name: voice-api
 // History: generated audio is saved to our own storage + generation_history table and deleted from ElevenLabs' history.
 const EL = 'https://api.elevenlabs.io/v1';
@@ -55,12 +55,18 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
   // Voices in the ElevenLabs account itself (premade + saved library voices) may be used by any signed-in user.
   // Free plans can't use library voices through the API (402), so on a free plan only premade voices are offered.
   let accountVoices: { voice_id: string; name: string; category: string; labels: Record<string, string>; preview_url: string }[] | null = null;
+  let sub: Record<string, unknown> | null | undefined;
+  const subscription = async () => {   // the ElevenLabs plan (tier, character usage); null if unavailable
+    if (sub !== undefined) return sub;
+    const r = await f(`${EL}/user/subscription`, { headers: xi });
+    if (!r.ok) console.error('[voice-api] subscription lookup failed', r.status);
+    return sub = r.ok ? await r.json() : null;
+  };
   const listAccountVoices = async () => {
     if (accountVoices) return accountVoices;
     const r = await f(`${EL}/voices`, { headers: xi });
     if (!r.ok) { console.error('[voice-api] voice list failed', r.status); return []; }
-    const b = await r.json(), sub = await f(`${EL}/user/subscription`, { headers: xi });
-    const tier = sub.ok ? String((await sub.json()).tier ?? '') : '';
+    const b = await r.json(), tier = String((await subscription())?.tier ?? '');
     return accountVoices = (b.voices ?? []).filter((v: { category?: string }) => v.category !== 'cloned' && (tier !== 'free' || v.category === 'premade'));
   };
   const usable = async (id: string) => VOICE_ID.test(id) && ((await owns(id)) || (await listAccountVoices()).some(v => v.voice_id === id));
@@ -116,6 +122,12 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       const list = await listAccountVoices();
       return json({ voices: list.map(v => ({ voice_id: v.voice_id, name: v.name, category: v.category, preview_url: v.preview_url,
         gender: v.labels?.gender ?? null, language: v.labels?.language ?? null, accent: v.labels?.accent ?? null })) });
+    }
+
+    if (route === 'usage') {
+      const p = await subscription();
+      if (!p) return json({ error: 'usage unavailable' }, 502);
+      return json({ tier: p.tier ?? null, used: Number(p.character_count ?? 0), limit: Number(p.character_limit ?? 0), resetUnix: p.next_character_count_reset_unix ?? null });
     }
 
     if (route === 'clone') {

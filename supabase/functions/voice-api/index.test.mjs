@@ -8,6 +8,9 @@ const mockFetch = (owned = true) => async (url, init = {}) => {
   calls.push({ url: String(url), init });
   if (String(url).endsWith('/auth/v1/user')) return new Response(JSON.stringify({ id: 'u1' }), { status: init.headers?.authorization === 'Bearer t' ? 200 : 401 });
   if (String(url).includes('/rest/v1/voices')) return new Response(JSON.stringify(owned ? [{ id: 'x' }] : []), { status: 200 });
+  if (String(url).endsWith('/v1/voices')) return new Response(JSON.stringify({ voices: [
+    { voice_id: 'premadeVoice0001', name: 'Roger', category: 'premade', labels: { gender: 'male', language: 'en' }, preview_url: 'https://x/p.mp3' },
+    { voice_id: 'someonesClone001', name: 'Clone', category: 'cloned', labels: {}, preview_url: '' }] }), { status: 200 });
   if (String(url).endsWith('/voices/add')) return new Response(JSON.stringify({ voice_id: 'abcdefghij123' }), { status: 200 });
   if (String(url).includes('/text-to-speech/')) return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
   if (String(url).includes('/speech-to-speech/')) return new Response(new Uint8Array([4, 5]), { status: 200 });
@@ -56,3 +59,14 @@ test('provider errors surface as readable messages', async () => {
   const r = await handle(post('tts', { voice_id: 'abcdefghij123', text: 'hi' }), d);
   assert.equal(r.status, 401); assert.equal((await r.json()).error, 'ElevenLabs 401: quota exceeded');
 });
+
+test('voices lists account voices but not other users\' clones', async () => {
+  const r = await handle(post('voices', {}), deps()); const { voices } = await r.json();
+  assert.deepEqual(voices.map(v => v.name), ['Roger']); assert.equal(voices[0].gender, 'male');
+});
+test('tts allows an account voice the caller does not own', async () => assert.equal((await handle(post('tts', { voice_id: 'premadeVoice0001', text: 'hi' }), deps(false))).status, 200));
+test('tts still refuses unknown voices and account clones', async () => {
+  assert.equal((await handle(post('tts', { voice_id: 'someonesClone001', text: 'hi' }), deps(false))).status, 404);
+  assert.equal((await handle(post('tts', { voice_id: 'unknownVoice0001', text: 'hi' }), deps(false))).status, 404);
+});
+test('delete never removes account voices the caller does not own', async () => assert.equal((await handle(post('delete', { voice_id: 'premadeVoice0001' }), deps(false))).status, 404));

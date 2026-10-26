@@ -120,8 +120,25 @@ const S = {
   tts: { sysVoice: ls.get('sysvoice', ''), voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.', stability: .7, similarity: .6 },
   ttsResult: null, v2v: { sample: null, voiceId: null }, v2vResult: null,
   libTab: 'mine', libQuery: '', stopPlayback: null,
+  elVoices: ls.get('elvoices', []),   // voices from the ElevenLabs account (hosted mode)
 };
-const allVoices = () => [...S.voices, ...PRESETS];
+const allVoices = () => [...S.voices, ...S.elVoices, ...PRESETS];
+/** Fetch the ElevenLabs account's own voices through voice-api; re-render screens that list voices. */
+async function loadElVoices() {
+  if (!cloud.hosted || !S.user) return;
+  try {
+    const { voices } = await (await cloud.fn('voices', '{}')).json();
+    S.elVoices = voices.map(v => ({ id: 'el-' + v.voice_id, remote: v.voice_id, name: v.name, preview: v.preview_url, gender: v.gender === 'male' || v.gender === 'female' ? v.gender : undefined,
+      cat: ['ElevenLabs', v.language, v.accent].filter(Boolean).join(' • '), dur: 0, preset: true, el: true }));
+    ls.set('elvoices', S.elVoices);
+    if (['#/tts', '#/v2v', '#/library'].includes(location.hash)) render();
+  } catch (e) { console.warn('[elevenlabs voices]', e); }
+}
+/** Plays a remote audio URL (voice previews). */
+const urlSource = url => ({ duration: 5, play(onEnd) {
+  const el = new Audio(url); let off = false; el.onended = el.onerror = () => { if (!off) onEnd(); }; el.play().catch(() => { if (!off) onEnd(); });
+  return () => { off = true; el.pause(); };
+} });
 const findVoice = id => allVoices().find(v => v.id === id);
 const saveVoices = () => ls.set('voices', S.voices);
 const saveRecents = () => ls.set('recents', S.recents.slice(0, 20));
@@ -462,7 +479,7 @@ const baseVoiceDropdown = (id, sel) => {
   return ddHtml(id, [{ items: [{ value: '', label: 'Automatic', sub: 'neural voice matching male/female' }] }, { title: 'Neural voices', items: neural }, ...(dev.length ? [{ title: 'Device voices (offline)', items: dev }] : [])], sel);
 };
 const voiceItem = v => ({ value: v.id, label: v.name, sub: `${v.cat}${v.pitch ? ` • ${v.pitch} Hz` : ''}${v.fx ? ` • ${v.fx}` : ''}` });
-const voiceDropdown = (id, sel) => ddHtml(id, [...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(voiceItem) }] : []), { title: 'Preset voices', items: PRESETS.map(voiceItem) }], sel);
+const voiceDropdown = (id, sel) => ddHtml(id, [...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(voiceItem) }] : []), ...(S.elVoices.length ? [{ title: 'ElevenLabs voices', items: S.elVoices.map(voiceItem) }] : []), { title: 'Preset voices', items: PRESETS.map(voiceItem) }], sel);
 const go = r => { location.hash = '#/' + r; };
 
 const V = {};
@@ -473,6 +490,7 @@ async function startSession(u) {
   S.user = { id: u.email, name: nm.charAt(0).toUpperCase() + nm.slice(1) }; ls.set('user', S.user);
   const d = await cloud.pull();
   if (d) { S.voices = d.voices; S.recents = d.recents; saveVoices(); saveRecents(); }
+  loadElVoices();
 }
 
 V.splash = () => ({
@@ -614,14 +632,14 @@ V.library = () => ({
     <div id="list"></div><div class="grow"></div><button class="btn" data-go="create">${icon('plus')} Create New Voice</button>${nav('library')}</section>`,
   bind: r => {
     const draw = () => {
-      const list = (S.libTab === 'mine' ? S.voices : PRESETS).filter(v => v.name.toLowerCase().includes(S.libQuery.toLowerCase()));
+      const list = (S.libTab === 'mine' ? S.voices : [...S.elVoices, ...PRESETS]).filter(v => v.name.toLowerCase().includes(S.libQuery.toLowerCase()));
       $('#list', r).innerHTML = list.length ? list.map(v => `<div class="row" data-id="${v.id}"><button class="play" data-play>${icon('play')}</button>
-        <div class="info"><strong>${esc(v.name)}</strong><small>${esc(v.cat)} • ${Math.max(1, Math.round(v.dur / 60))} min${v.pitch ? ` • ${v.pitch} Hz` : ''}</small></div>
+        <div class="info"><strong>${esc(v.name)}</strong><small>${esc(v.cat)}${v.el ? '' : ` • ${Math.max(1, Math.round(v.dur / 60))} min`}${v.pitch ? ` • ${v.pitch} Hz` : ''}</small></div>
         ${v.preset ? '' : '<button class="menu-btn" data-menu aria-label="Voice options">⋮</button>'}</div>`).join('')
         : `<div class="empty">${S.libTab === 'mine' ? 'No voices yet – create your first one.' : 'No matching voices.'}</div>`;
       $$('[data-play]', r).forEach(b => b.onclick = async () => {
         const v = findVoice(b.closest('.row').dataset.id); if (S.stopPlayback) S.stopPlayback();
-        const sample = v.preset ? null : await blobs.get('sample:' + v.id), src = sample ? bufferSource(await decode(sample)) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1);
+        const sample = v.preset ? null : await blobs.get('sample:' + v.id), src = sample ? bufferSource(await decode(sample)) : v.preview ? urlSource(v.preview) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1);
         let stop; const reset = () => { b.innerHTML = icon('play'); S.stopPlayback = null; };
         stop = src.play(reset); b.innerHTML = icon('pause'); S.stopPlayback = () => { stop(); reset(); };
       });
@@ -779,7 +797,7 @@ V.profile = () => ({
     <div class="card"><strong>${S.voices.length}</strong> custom voice${S.voices.length === 1 ? '' : 's'} saved on this device</div>
     <div class="grow"></div><button class="btn outline" id="out">Sign out</button><div class="gap"></div><button class="btn outline" id="wipe" style="color:var(--red)">Delete all local data</button>${nav('profile')}</section>`,
   bind: r => {
-    $('#out', r).onclick = async () => { await cloud.signOut(); S.user = null; ls.set('user', null); go('login'); };
+    $('#out', r).onclick = async () => { await cloud.signOut(); S.user = null; S.elVoices = []; ls.set('user', null); ls.set('elvoices', []); go('login'); };
     $('#wipe', r).onclick = () => { if (!confirm('Delete all voices, audio and your account from this browser?')) return;
       indexedDB.deleteDatabase('jolovocals'); ['user', 'voices', 'recents'].forEach(k => localStorage.removeItem('jv.' + k)); location.hash = '#/splash'; location.reload(); };
   } });

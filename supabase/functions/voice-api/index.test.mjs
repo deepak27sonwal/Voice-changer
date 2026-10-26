@@ -8,7 +8,7 @@ const lastTo = part => [...calls].reverse().find(c => c.url.includes(part));
 let tier = 'starter';
 const mockFetch = (owned = true) => async (url, init = {}) => {
   calls.push({ url: String(url), init });
-  if (String(url).endsWith('/user/subscription')) return new Response(JSON.stringify({ tier }), { status: 200 });
+  if (String(url).endsWith('/user/subscription')) return new Response(JSON.stringify({ tier, character_count: 3760, character_limit: 10000, next_character_count_reset_unix: 1793750400 }), { status: 200 });
   if (String(url).endsWith('/auth/v1/user')) return new Response(JSON.stringify({ id: 'u1' }), { status: init.headers?.authorization === 'Bearer t' ? 200 : 401 });
   if (String(url).includes('/v1/history?')) return new Response(JSON.stringify({ history: [] }), { status: 200 });
   if (String(url).includes('/v1/history/') && init.method === 'DELETE') return new Response('{}', { status: 200 });
@@ -211,4 +211,14 @@ test('history-delete refuses items that belong to someone else', async () => {
 });
 test('history-delete rejects malformed ids', async () => {
   assert.equal((await handle(post('history-delete', { id: '../../x' }), histDeps({ fetch: historyStore('u1') }))).status, 404);
+});
+
+test('usage reports the plan, characters used, limit and reset time', async () => {
+  const r = await handle(post('usage', {}), deps()); assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { tier: 'starter', used: 3760, limit: 10000, resetUnix: 1793750400 });
+});
+test('usage requires sign-in', async () => assert.equal((await handle(post('usage', {}, false), deps())).status, 401));
+test('usage reports a clear error when ElevenLabs is unreachable', async () => {
+  const d = { ...deps(), fetch: async u => String(u).endsWith('/auth/v1/user') ? new Response('{"id":"u1"}') : new Response('nope', { status: 500 }) };
+  const r = await handle(post('usage', {}), d); assert.equal(r.status, 502); assert.equal((await r.json()).error, 'usage unavailable');
 });

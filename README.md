@@ -25,3 +25,11 @@ The in-browser path matches pitch only. For voices that actually sound like the 
 4. Set `HOSTED_VOICES: true` in `config.js`.
 
 With it on, signed-in users get: real cloning when a voice is saved, Text to Voice in the cloned voice (multilingual, including Hindi, with Stability/Similarity mapped to the provider), and Voice to Voice conversion. Voices without a hosted clone, and any provider error, fall back to the in-browser engines. Samples are sent to ElevenLabs (the consent screen says so) and removed when the voice is deleted. The function only serves voices that belong to the caller (checked through row-level security). Tests: `node --test supabase/functions/voice-api/index.test.mjs`.
+
+## Engagement & power features
+- **Live Voice Changer** (`#/live`): talk into the mic and hear yourself transformed in real time – Robot, Monster, Chipmunk, Alien, Radio, Telephone, Echo, Stadium, Cave, Ghost – with pitch (±12 semitones, an AudioWorklet pitch shifter), echo and reverb controls, and recording. Fully in the browser, no credits used.
+- **Effects rack**: the same effects can be applied to any generated or converted audio from the result screens (rendered offline, always from the unprocessed audio).
+- **Installable app (PWA)**: `manifest.webmanifest` + `sw.js` (network-first app shell, works offline); "Install app" on Home/Profile.
+- **Usage dashboard**: ElevenLabs credits left (via the `usage` route of `voice-api`), day streak, generations this week / last 90 days.
+- **Favourites & previews**: ★ and ▶ on every voice in the pickers and library; favourites and recently used voices are listed first.
+- **Templates**: one-tap starters (birthday wish, ad, bedtime story, Hindi greeting…) on Home and in Text to Voice.

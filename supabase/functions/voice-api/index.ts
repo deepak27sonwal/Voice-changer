@@ -29,6 +29,10 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
   if (!req.headers.get('authorization')) return json({ error: 'sign in required' }, 401);
   if (!deps.elevenKey) return json({ error: 'voice provider is not configured' }, 500);
 
+  // Require a real signed-in user, not just the public app key (works whether or not "Verify JWT" is on).
+  const who = await f(`${deps.supabaseUrl}/auth/v1/user`, { headers: { apikey: deps.anonKey, authorization: req.headers.get('authorization')! } });
+  if (!who.ok) return json({ error: 'sign in required' }, 401);
+
   const xi = { 'xi-api-key': deps.elevenKey };
   // Row-level security makes this query return only voices that belong to the caller.
   const owns = async (id: string) => {

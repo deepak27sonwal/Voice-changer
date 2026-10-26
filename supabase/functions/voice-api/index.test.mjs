@@ -6,6 +6,7 @@ import { handle } from './index.ts';
 const calls = [];
 const mockFetch = (owned = true) => async (url, init = {}) => {
   calls.push({ url: String(url), init });
+  if (String(url).endsWith('/auth/v1/user')) return new Response(JSON.stringify({ id: 'u1' }), { status: init.headers?.authorization === 'Bearer t' ? 200 : 401 });
   if (String(url).includes('/rest/v1/voices')) return new Response(JSON.stringify(owned ? [{ id: 'x' }] : []), { status: 200 });
   if (String(url).endsWith('/voices/add')) return new Response(JSON.stringify({ voice_id: 'abcdefghij123' }), { status: 200 });
   if (String(url).includes('/text-to-speech/')) return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
@@ -20,6 +21,10 @@ const post = (path, body, auth = true) => new Request(`https://p.supabase.co/fun
 });
 
 test('requires sign-in', async () => assert.equal((await handle(post('tts', {}, false), deps())).status, 401));
+test('rejects the public app key used as a bearer token', async () => {
+  const req = new Request('https://p.supabase.co/functions/v1/voice-api/clone', { method: 'POST', headers: { authorization: 'Bearer anon-key' }, body: new FormData() });
+  assert.equal((await handle(req, deps())).status, 401);
+});
 test('clone returns the provider voice id and never leaks the key', async () => {
   const f = new FormData(); f.set('name', 'Me'); f.set('file', new Blob([new Uint8Array(10)], { type: 'audio/wav' }));
   const r = await handle(post('clone', f), deps()); assert.equal((await r.json()).voice_id, 'abcdefghij123');
@@ -47,7 +52,7 @@ test('sts converts uploaded audio', async () => {
 });
 test('delete removes an owned voice', async () => assert.equal((await handle(post('delete', { voice_id: 'abcdefghij123' }), deps())).status, 200));
 test('provider errors surface as readable messages', async () => {
-  const d = { ...deps(), fetch: async u => String(u).includes('/rest/') ? new Response('[{"id":1}]') : new Response('{"detail":{"message":"quota exceeded"}}', { status: 401 }) };
+  const d = { ...deps(), fetch: async u => String(u).endsWith('/auth/v1/user') ? new Response('{}') : String(u).includes('/rest/') ? new Response('[{"id":1}]') : new Response('{"detail":{"message":"quota exceeded"}}', { status: 401 }) };
   const r = await handle(post('tts', { voice_id: 'abcdefghij123', text: 'hi' }), d);
   assert.equal(r.status, 401); assert.equal((await r.json()).error, 'quota exceeded');
 });

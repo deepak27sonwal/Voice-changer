@@ -1,7 +1,7 @@
-// Run with: node --test supabase/functions/voice-api/handler.test.mjs   (Node 22.18+)
+// Run with: node --test supabase/functions/voice-api/index.test.mjs   (Node 22.18+)
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { handle } from './handler.ts';
+import { handle } from './index.ts';
 
 const calls = [];
 const mockFetch = (owned = true) => async (url, init = {}) => {

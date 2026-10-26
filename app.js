@@ -13,6 +13,7 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const ago = t => { const m = (Date.now() - t) / 6e4; return m < 1 ? 'just now' : m < 60 ? `${Math.floor(m)} min ago` : m < 1440 ? `${Math.floor(m / 60)} h ago` : `${Math.floor(m / 1440)} days ago`; };
 
 const P = {
+  chev: '<path d="M6 9l6 6 6-6"/>',
   play: '<path d="M6 4l14 8-14 8z"/>', pause: '<path d="M6 4h4v16H6zM14 4h4v16h-4z"/>',
   back: '<path d="M19 12H5M12 19l-7-7 7-7"/>', home: '<path d="M3 11l9-8 9 8v10a1 1 0 01-1 1h-5v-7H9v7H4a1 1 0 01-1-1z"/>',
   mic: '<path d="M12 2a3 3 0 00-3 3v7a3 3 0 006 0V5a3 3 0 00-3-3zM19 11a7 7 0 01-14 0M12 18v4"/>',
@@ -48,12 +49,59 @@ const idb = (() => {
   return { put: (k, v) => tx('readwrite', s => s.put(v, k)).catch(() => {}), get: k => tx('readonly', s => s.get(k)).catch(() => undefined), del: k => tx('readwrite', s => s.delete(k)).catch(() => {}) };
 })();
 
+/* ───────────── optional Supabase sync (active only when config.js has a key) ───────────── */
+const cloud = (() => {
+  const cfg = window.JV_CONFIG || {}, on = !!(window.supabase && cfg.SUPABASE_URL && cfg.SUPABASE_KEY);
+  const sb = on ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_KEY) : null;
+  let uid_ = null;
+  const safe = async fn => { try { const r = await fn(); if (r?.error) throw r.error; return r; } catch (e) { console.warn('[cloud]', e.message || e); return null; } };
+  const path = f => `${uid_}/${f.replace(':', '-')}`;
+  return {
+    on,
+    async session() { const { data } = await sb.auth.getSession(); const u = data.session?.user || null; uid_ = u?.id || null; return u; },
+    async auth(mode, email, password) {
+      const { data, error } = mode === 'up' ? await sb.auth.signUp({ email, password }) : await sb.auth.signInWithPassword({ email, password });
+      if (error) throw error; uid_ = data.session?.user?.id || null; return data;
+    },
+    signOut: () => safe(() => sb.auth.signOut()).then(() => { uid_ = null; }),
+    async pull() {
+      const [v, r] = await Promise.all([sb.from('voices').select('*').order('created', { ascending: false }), sb.from('recents').select('*').order('ts', { ascending: false }).limit(20)]);
+      if (v.error || r.error) return null;
+      return { voices: v.data.map(({ user_id, ...x }) => x), recents: r.data.map(({ user_id, voice_id, ...x }) => ({ ...x, voiceId: voice_id })) };
+    },
+    upsertVoice: v => on && uid_ && safe(() => sb.from('voices').upsert({ id: v.id, name: v.name, cat: v.cat, pitch: v.pitch, dur: v.dur, created: v.created }, { onConflict: 'user_id,id' })),
+    deleteVoice: id => on && uid_ && safe(() => sb.from('voices').delete().eq('id', id)),
+    upsertRecent: a => on && uid_ && safe(() => sb.from('recents').upsert({ id: a.id, kind: a.kind, title: a.title, text: a.text ?? null, voice_id: a.voiceId ?? null, ts: a.ts, dur: a.dur }, { onConflict: 'user_id,id' })),
+    deleteRecent: id => on && uid_ && safe(() => sb.from('recents').delete().eq('id', id)),
+    putBlob: (key, blob) => on && uid_ && safe(() => sb.storage.from('voice-audio').upload(path(key), blob, { upsert: true, contentType: blob.type || 'audio/wav' })),
+    async getBlob(key) { if (!on || !uid_) return undefined; const r = await safe(() => sb.storage.from('voice-audio').download(path(key))); return r?.data || undefined; },
+    delBlob: key => on && uid_ && safe(() => sb.storage.from('voice-audio').remove([path(key)])),
+  };
+})();
+/** Blob store: IndexedDB as a local cache, Supabase Storage as the source of truth when enabled. */
+const blobs = {
+  put: async (key, blob) => { await idb.put(key, blob); cloud.putBlob(key, blob); },
+  get: async key => (await idb.get(key)) || (await cloud.getBlob(key).then(async b => { if (b) await idb.put(key, b); return b; })),
+  del: key => { idb.del(key); cloud.delBlob(key); },
+};
+
 const PRESETS = [
   { id: 'pre-narrator', name: 'Female Narrator', cat: 'English', pitch: 210, dur: 60, preset: true },
   { id: 'pre-anchor', name: 'News Anchor', cat: 'Hindi', pitch: 115, dur: 60, preset: true },
   { id: 'pre-char', name: 'Character 1', cat: 'Custom', pitch: 290, dur: 180, preset: true },
   { id: 'pre-deep', name: 'Deep Voice', cat: 'English', pitch: 85, dur: 90, preset: true },
+  { id: 'pre-man', name: 'Young Man', cat: 'Male', pitch: 125, dur: 60, preset: true },
+  { id: 'pre-elder', name: 'Elderly Man', cat: 'Male', pitch: 100, dur: 60, preset: true },
+  { id: 'pre-woman', name: 'Soft Woman', cat: 'Female', pitch: 235, dur: 60, preset: true },
+  { id: 'pre-grand', name: 'Elderly Woman', cat: 'Female', pitch: 195, dur: 60, preset: true },
+  { id: 'pre-child', name: 'Child', cat: 'Character', pitch: 330, dur: 60, preset: true },
+  { id: 'pre-monster', name: 'Monster', cat: 'Character', pitch: 60, dur: 60, preset: true },
+  { id: 'pre-chip', name: 'Chipmunk', cat: 'Effects', pitch: 400, dur: 60, preset: true },
+  { id: 'pre-robot', name: 'Robot', cat: 'Effects', pitch: 140, fx: 'robot', dur: 60, preset: true },
+  { id: 'pre-alien', name: 'Alien', cat: 'Effects', pitch: 300, fx: 'robot', dur: 60, preset: true },
+  { id: 'pre-whisper', name: 'Whisper', cat: 'Effects', pitch: 160, fx: 'whisper', dur: 60, preset: true },
 ];
+const CATEGORIES = ['Personal', 'English', 'Hindi', 'Male', 'Female', 'Character', 'Effects', 'Custom'];
 const S = {
   user: ls.get('user', null),
   voices: ls.get('voices', []),
@@ -126,6 +174,15 @@ function pitchShift(buf, ratio) {
   const res = new Float32Array(n);
   for (let i = 0; i < n; i++) res[i] = wsum[i] > 1e-3 ? out[i] / wsum[i] : 0;
   return { data: res, sr: buf.sampleRate };
+}
+
+/** Voice effects applied after pitch shifting: 'robot' (ring modulation) and 'whisper' (noise shaped by the speech envelope). */
+function applyFx(data, sr, fx) {
+  if (!fx) return data;
+  const out = new Float32Array(data.length);
+  if (fx === 'robot') { for (let i = 0; i < data.length; i++) out[i] = data[i] * (.35 + .65 * Math.sin(2 * Math.PI * 60 * i / sr)); }
+  else if (fx === 'whisper') { let env = 0; const k = 1 - Math.exp(-1 / (sr * .01)); for (let i = 0; i < data.length; i++) { env += (Math.abs(data[i]) - env) * k; out[i] = (Math.random() * 2 - 1) * env * 2.2; } }
+  return out;
 }
 
 function encodeWav(data, sr) {
@@ -229,10 +286,44 @@ const nav = on => `<nav class="bottom">
   <button class="mic" data-go="v2v" aria-label="Voice to voice">${icon('mic')}</button>
   ${[['library', 'lib', 'Library'], ['profile', 'user', 'Profile']].map(([r, ic, l]) => `<button data-go="${r}" class="${on === r ? 'on' : ''}">${icon(ic)}${l}</button>`).join('')}</nav>`;
 const top = (title, back = true) => `<div class="top">${back ? `<button class="icon-btn" data-back aria-label="Back">${icon('back')}</button>` : ''}<h2>${title}</h2></div>`;
-const voiceOptions = sel => allVoices().map(v => `<option value="${v.id}" ${v.id === sel ? 'selected' : ''}>${esc(v.name)}</option>`).join('');
+/** Custom dropdown. Renders <div class="dd" id=…>; after bind, `el.value` and a 'change' event work like a <select>. */
+const ddHtml = (id, groups, sel) => {
+  const flat = groups.flatMap(g => g.items), cur = flat.find(o => o.value === sel) || flat[0];
+  return `<div class="dd" id="${id}" data-value="${esc(cur.value)}"><button type="button" class="field dd-btn" aria-haspopup="listbox" aria-expanded="false"><span class="dd-label">${esc(cur.label)}${cur.sub ? `<small>${esc(cur.sub)}</small>` : ''}</span><span class="dd-caret">${icon('chev')}</span></button>
+    <ul class="dd-list" role="listbox" hidden>${groups.map(g => (g.title ? `<li class="dd-group" role="presentation">${esc(g.title)}</li>` : '') + g.items.map(o => `<li role="option" tabindex="-1" data-v="${esc(o.value)}" aria-selected="${o.value === cur.value}"><span>${esc(o.label)}</span>${o.sub ? `<small>${esc(o.sub)}</small>` : ''}</li>`).join('')).join('')}</ul></div>`;
+};
+function bindDropdowns(root) {
+  $$('.dd', root).forEach(dd => {
+    const btn = $('.dd-btn', dd), list = $('.dd-list', dd), opts = $$('[role=option]', dd);
+    Object.defineProperty(dd, 'value', { get: () => dd.dataset.value });
+    const close = () => { list.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
+    const open = () => { $$('.dd-list').forEach(l => { l.hidden = true; }); list.hidden = false; btn.setAttribute('aria-expanded', 'true');
+      const s = $('[aria-selected=true]', dd); s?.scrollIntoView({ block: 'nearest' }); s?.focus(); };
+    const pick = o => { dd.dataset.value = o.dataset.v; opts.forEach(x => x.setAttribute('aria-selected', x === o));
+      $('.dd-label', dd).innerHTML = o.innerHTML; close(); btn.focus(); dd.dispatchEvent(new Event('change')); };
+    btn.onclick = () => list.hidden ? open() : close();
+    opts.forEach(o => { o.onclick = () => pick(o);
+      o.onkeydown = e => { const i = opts.indexOf(o);
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(o); }
+        else if (e.key === 'ArrowDown') { e.preventDefault(); opts[Math.min(i + 1, opts.length - 1)].focus(); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); opts[Math.max(i - 1, 0)].focus(); }
+        else if (e.key === 'Escape') { close(); btn.focus(); } }; });
+  });
+}
+document.addEventListener('click', e => { if (!e.target.closest('.dd')) $$('.dd-list').forEach(l => { l.hidden = true; }); });
+const voiceItem = v => ({ value: v.id, label: v.name, sub: `${v.cat}${v.pitch ? ` • ${v.pitch} Hz` : ''}${v.fx ? ` • ${v.fx}` : ''}` });
+const voiceDropdown = (id, sel) => ddHtml(id, [...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(voiceItem) }] : []), { title: 'Preset voices', items: PRESETS.map(voiceItem) }], sel);
 const go = r => { location.hash = '#/' + r; };
 
 const V = {};
+
+/** After a cloud sign-in or session restore: set the user and replace local lists with the account's data. */
+async function startSession(u) {
+  const nm = (u.email || 'Friend').split('@')[0];
+  S.user = { id: u.email, name: nm.charAt(0).toUpperCase() + nm.slice(1) }; ls.set('user', S.user);
+  const d = await cloud.pull();
+  if (d) { S.voices = d.voices; S.recents = d.recents; saveVoices(); saveRecents(); }
+}
 
 V.splash = () => ({
   html: `<section class="screen splash"><div class="bars">${[30, 55, 80, 100, 75, 50, 30].map((h, i) => `<span style="height:${h}%;animation-delay:${i * .12}s"></span>`).join('')}</div>
@@ -251,11 +342,22 @@ V.login = () => {
     <form id="f"><label class="lbl" style="margin-top:0">Email or phone number</label><input class="field" id="id" placeholder="Enter your email or phone" autocomplete="username" required>
     <label class="lbl">Password</label><input class="field" id="pw" type="password" placeholder="Enter your password" autocomplete="current-password" required minlength="4">
     <div class="gap"></div><button class="btn" id="go">Sign In</button></form>
-    <p class="muted center" style="margin-top:14px">Demo mode: accounts are stored only in this browser.</p></section>`,
+    <p class="muted center" style="margin-top:14px">${cloud.on ? 'Your voices sync to your account.' : 'Demo mode: accounts are stored only in this browser.'}</p></section>`,
   bind: r => {
     $$('[data-demo]', r).forEach(b => b.onclick = () => toast('Social sign-in needs a backend – use email/phone for the demo'));
     $$('.tabs button', r).forEach(b => b.onclick = () => { mode = b.dataset.m; $$('.tabs button', r).forEach(x => x.classList.toggle('on', x === b)); $('#go', r).textContent = mode === 'in' ? 'Sign In' : 'Create Account'; });
-    $('#f', r).onsubmit = e => { e.preventDefault(); const id = $('#id', r).value.trim(), nm = id.includes('@') ? id.split('@')[0] : 'Friend';
+    $('#f', r).onsubmit = async e => { e.preventDefault(); const id = $('#id', r).value.trim(), pw = $('#pw', r).value;
+      if (cloud.on) {
+        if (!id.includes('@')) return toast('Please sign in with your email address');
+        const btn = $('#go', r); btn.disabled = true;
+        try {
+          const d = await cloud.auth(mode, id, pw);
+          if (!d.session) { btn.disabled = false; return toast('Check your email to confirm your account, then sign in'); }
+          await startSession(d.session.user); go('home');
+        } catch (err) { btn.disabled = false; toast(err.message || 'Sign-in failed'); }
+        return;
+      }
+      const nm = id.includes('@') ? id.split('@')[0] : 'Friend';
       S.user = { id, name: nm.charAt(0).toUpperCase() + nm.slice(1) }; ls.set('user', S.user); go('home'); };
   } };
 };
@@ -276,7 +378,7 @@ V.home = () => {
 async function openRecent(id) {
   const a = S.recents.find(x => x.id === id); if (!a) return;
   if (a.kind === 'tts') { S.ttsResult = { text: a.text, voiceId: a.voiceId, id: a.id }; return go('tts-result'); }
-  const blob = await idb.get('audio:' + id); if (!blob) return toast('That audio is no longer stored');
+  const blob = await blobs.get('audio:' + id); if (!blob) return toast('That audio is no longer stored');
   const buf = await decode(blob); S.v2vResult = { id, original: null, converted: buf, blob, ...(S.v2vResult?.id === id ? S.v2vResult : {}) }; go('v2v-result');
 }
 
@@ -335,7 +437,7 @@ V.created = () => ({
   html: `<section class="screen">${top('Voice Created', false)}<div class="okmark">${icon('check')}</div>
     <div class="center"><h2>Your voice is ready!</h2><p class="muted">Give a name to your voice and choose a category.</p></div>
     <div class="gap"></div><input class="field" id="name" value="${esc((S.user?.name || 'My') + ' Voice')}" maxlength="40">
-    <div class="gap"></div><select class="field" id="cat">${['Personal', 'English', 'Hindi', 'Custom'].map(c => `<option>${c}</option>`).join('')}</select>
+    <div class="gap"></div>${ddHtml('cat', [{ items: CATEGORIES.map(c => ({ value: c, label: c })) }], 'Personal')}
     <p class="muted" style="margin-top:10px">Detected pitch: ${S.draft?.pitch ? S.draft.pitch + ' Hz' : 'unknown (default will be used)'}</p>
     <div class="grow"></div><div class="gap"></div><button class="btn" id="save">Save Voice</button><div class="gap"></div>
     <div class="btn ghost" style="padding:0" id="pl"><div style="width:100%;padding:10px 14px">${playerHtml(S.draft ? peaks(S.draft.buf, 24) : fakePeaks(3, 24), S.draft?.dur || 0)}</div></div></section>`,
@@ -345,7 +447,7 @@ V.created = () => ({
     $('#save', r).onclick = () => {
       const name = $('#name', r).value.trim(); if (!name) return toast('Please enter a name');
       const v = { id: d.tmpId, name, cat: $('#cat', r).value, pitch: d.pitch || 150, dur: d.dur, created: Date.now() };
-      S.voices.unshift(v); saveVoices(); S.draft = null; toast('Voice saved'); go('library');
+      S.voices.unshift(v); saveVoices(); cloud.upsertVoice(v); cloud.putBlob('sample:' + v.id, d.blob); S.draft = null; toast('Voice saved'); go('library');
     };
   } });
 
@@ -362,14 +464,14 @@ V.library = () => ({
         : `<div class="empty">${S.libTab === 'mine' ? 'No voices yet – create your first one.' : 'No matching voices.'}</div>`;
       $$('[data-play]', r).forEach(b => b.onclick = async () => {
         const v = findVoice(b.closest('.row').dataset.id); if (S.stopPlayback) S.stopPlayback();
-        const sample = v.preset ? null : await idb.get('sample:' + v.id), src = sample ? bufferSource(await decode(sample)) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1);
+        const sample = v.preset ? null : await blobs.get('sample:' + v.id), src = sample ? bufferSource(await decode(sample)) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1);
         let stop; const reset = () => { b.innerHTML = icon('play'); S.stopPlayback = null; };
         stop = src.play(reset); b.innerHTML = icon('pause'); S.stopPlayback = () => { stop(); reset(); };
       });
       $$('[data-menu]', r).forEach(b => b.onclick = async () => {
         const v = findVoice(b.closest('.row').dataset.id), a = prompt(`"${v.name}" – type "rename" or "delete"`, 'rename'); if (!a) return;
-        if (a.toLowerCase() === 'delete' && confirm(`Delete ${v.name}?`)) { S.voices = S.voices.filter(x => x.id !== v.id); saveVoices(); idb.del('sample:' + v.id); }
-        else if (a.toLowerCase() === 'rename') { const n = prompt('New name', v.name); if (n && n.trim()) { v.name = n.trim().slice(0, 40); saveVoices(); } }
+        if (a.toLowerCase() === 'delete' && confirm(`Delete ${v.name}?`)) { S.voices = S.voices.filter(x => x.id !== v.id); saveVoices(); cloud.deleteVoice(v.id); blobs.del('sample:' + v.id); }
+        else if (a.toLowerCase() === 'rename') { const n = prompt('New name', v.name); if (n && n.trim()) { v.name = n.trim().slice(0, 40); saveVoices(); cloud.upsertVoice(v); } }
         draw();
       });
     };
@@ -381,7 +483,7 @@ V.library = () => ({
 V.tts = () => {
   const t = S.tts; t.voiceId = findVoice(t.voiceId) ? t.voiceId : allVoices()[0].id;
   return { html: `<section class="screen has-nav">${top('Text to Voice')}
-    <label class="lbl" style="margin-top:0">Select Voice</label><select class="field" id="v">${voiceOptions(t.voiceId)}</select>
+    <label class="lbl" style="margin-top:0">Select Voice</label>${voiceDropdown('v', t.voiceId)}
     <label class="lbl">Enter Text</label><textarea class="field" id="txt" maxlength="5000" placeholder="Type what the voice should say…">${esc(t.text)}</textarea>
     <div class="muted" style="text-align:right"><span id="cnt">${t.text.length}</span>/5000</div>
     <label class="lbl">Voice Settings</label>
@@ -411,11 +513,11 @@ V['tts-result'] = () => {
     <div class="grow"></div><button class="btn" id="again">Generate Again</button></section>`,
   bind: r => {
     const p = bindPlayer($('.player', r), async () => src);
-    if (res.fresh) { res.fresh = false; S.recents.unshift({ id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }); saveRecents(); }
+    if (res.fresh) { res.fresh = false; const item = { id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); }
     setTimeout(() => $('.play', r)?.click(), 250);
     $('#again', r).onclick = () => { p(); $('.play', r).click(); };
     $('#sh', r).onclick = () => navigator.share ? navigator.share({ title: 'JoloVocals', text: res.text }).catch(() => {}) : navigator.clipboard?.writeText(res.text).then(() => toast('Text copied'));
-    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); S.ttsResult = null; go('tts'); };
+    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); S.ttsResult = null; go('tts'); };
     $('#dl', r).onclick = () => toast('Downloads need a server-side TTS engine');
   } };
 };
@@ -424,7 +526,7 @@ V.v2v = () => {
   const st = S.v2v; st.voiceId = findVoice(st.voiceId) ? st.voiceId : allVoices()[0].id;
   return { html: `<section class="screen has-nav">${top('Voice to Voice')}${captureHtml('Upload or Record Audio', 120)}
     <div id="chosen">${st.sample ? chosenHtml(st.sample) : ''}</div>
-    <label class="lbl">Target Voice</label><select class="field" id="v">${voiceOptions(st.voiceId)}</select>
+    <label class="lbl">Target Voice</label>${voiceDropdown('v', st.voiceId)}
     <div class="grow"></div><div class="gap"></div><button class="btn" id="conv" ${st.sample ? '' : 'disabled'}>${icon('wave')} Convert Audio</button>${nav('v2v')}</section>`,
   bind: r => {
     const show = () => { $('#chosen', r).innerHTML = chosenHtml(st.sample); $('#conv', r).disabled = false; bindPlayer($('.filechip', r), async () => bufferSource(st.sample.buf)); };
@@ -435,11 +537,11 @@ V.v2v = () => {
       const btn = $('#conv', r), voice = findVoice(st.voiceId); btn.disabled = true; btn.textContent = 'Converting…'; stopRec(); await sleep(30);
       try {
         const srcPitch = detectPitch(st.sample.buf); if (!srcPitch) toast('Couldn’t detect the pitch of your audio – converting at neutral');
-        const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, { data, sr } = pitchShift(st.sample.buf, ratio);
+        const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, shifted = pitchShift(st.sample.buf, ratio), sr = shifted.sr, data = applyFx(shifted.data, sr, voice.fx);
         const out = ac().createBuffer(1, data.length, sr); out.copyToChannel(data, 0);
-        const id = uid(), blob = encodeWav(data, sr); await idb.put('audio:' + id, blob);
+        const id = uid(), blob = encodeWav(data, sr); await blobs.put('audio:' + id, blob);
         S.v2vResult = { id, original: st.sample.buf, converted: out, blob, voice: voice.name };
-        S.recents.unshift({ id, kind: 'v2v', title: `Converted to ${voice.name}`, ts: Date.now(), dur: out.duration }); saveRecents(); go('v2v-result');
+        const item = { id, kind: 'v2v', title: `Converted to ${voice.name}`, ts: Date.now(), dur: out.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); go('v2v-result');
       } catch (e) { console.error(e); toast('Conversion failed'); btn.disabled = false; btn.textContent = 'Convert Audio'; }
     };
   } };
@@ -461,18 +563,18 @@ V['v2v-result'] = () => {
     $('#dl', r).onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(res.blob); a.download = `jolovocals-${res.id}.wav`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
     $('#sh', r).onclick = async () => { const f = new File([res.blob], 'jolovocals.wav', { type: 'audio/wav' });
       if (navigator.canShare?.({ files: [f] })) navigator.share({ files: [f] }).catch(() => {}); else toast('Sharing files isn’t supported here – use Download'); };
-    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); idb.del('audio:' + res.id); S.v2vResult = null; go('v2v'); };
+    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); blobs.del('audio:' + res.id); S.v2vResult = null; go('v2v'); };
     $('#more', r).onclick = () => { S.v2v.sample = null; go('v2v'); };
   } };
 };
 
 V.profile = () => ({
   html: `<section class="screen has-nav">${top('Profile', false)}<div class="center"><div class="okmark" style="background:var(--soft);color:var(--p);width:84px;height:84px">${icon('user')}</div>
-    <h2>${esc(S.user.name)}</h2><p class="muted">${esc(S.user.id)}</p></div><div class="gap"></div>
+    <h2>${esc(S.user.name)}</h2><p class="muted">${esc(S.user.id)}</p><p class="muted">${cloud.on ? '☁ Synced to your account' : 'Stored on this device only'}</p></div><div class="gap"></div>
     <div class="card"><strong>${S.voices.length}</strong> custom voice${S.voices.length === 1 ? '' : 's'} saved on this device</div>
     <div class="grow"></div><button class="btn outline" id="out">Sign out</button><div class="gap"></div><button class="btn outline" id="wipe" style="color:var(--red)">Delete all local data</button>${nav('profile')}</section>`,
   bind: r => {
-    $('#out', r).onclick = () => { S.user = null; ls.set('user', null); go('login'); };
+    $('#out', r).onclick = async () => { await cloud.signOut(); S.user = null; ls.set('user', null); go('login'); };
     $('#wipe', r).onclick = () => { if (!confirm('Delete all voices, audio and your account from this browser?')) return;
       indexedDB.deleteDatabase('jolovocals'); ['user', 'voices', 'recents'].forEach(k => localStorage.removeItem('jv.' + k)); location.hash = '#/splash'; location.reload(); };
   } });
@@ -489,10 +591,16 @@ function render() {
   const view = V[name](); app.innerHTML = view.html; app._cleanup = null;
   $$('[data-go]', app).forEach(b => b.onclick = () => go(b.dataset.go));
   $$('[data-back]', app).forEach(b => b.onclick = () => history.length > 1 ? history.back() : go('home'));
-  const c = view.bind(app); app.scrollTo?.(0, 0); window.scrollTo(0, 0);
+  bindDropdowns(app); const c = view.bind(app); app.scrollTo?.(0, 0); window.scrollTo(0, 0);
   if (c && c.catch) c.catch(console.error);
 }
 window.addEventListener('hashchange', render);
 speechSynthesis?.getVoices();
-render();
+(async () => {
+  if (cloud.on) {
+    const u = await cloud.session().catch(() => null);
+    if (u) await startSession(u); else if (S.user) { S.user = null; ls.set('user', null); }
+  }
+  render();
+})();
 })();

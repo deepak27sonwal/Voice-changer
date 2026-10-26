@@ -33,3 +33,4 @@ With it on, signed-in users get: real cloning when a voice is saved, Text to Voi
 - **Usage dashboard**: ElevenLabs credits left (via the `usage` route of `voice-api`), day streak, generations this week / last 90 days.
 - **Favourites & previews**: ★ and ▶ on every voice in the pickers and library; favourites and recently used voices are listed first.
 - **Templates**: one-tap starters (birthday wish, ad, bedtime story, Hindi greeting…) on Home and in Text to Voice.
+- **Responsive design**: phone-first layout that adapts to small phones (≤360 px), tablets (≥600 px) and desktop (≥960 px, left sidebar navigation, wide content, two-column Text to Voice with the script editor beside the voice settings).

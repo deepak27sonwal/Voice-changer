@@ -16,8 +16,10 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 const clamp01 = (v: unknown, d: number) => { const n = Number(v); return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d; };
 
 async function upstreamError(r: Response): Promise<Response> {
-  let msg = `Voice provider error (${r.status})`;
-  try { const b = await r.json(); const d = b?.detail; msg = typeof d === 'string' ? d : d?.message || msg; } catch { /* keep default */ }
+  let msg = 'no details';
+  try { const b = await r.json(); const d = b?.detail; msg = typeof d === 'string' ? d : d?.message || d?.status || JSON.stringify(b).slice(0, 200); } catch { /* keep default */ }
+  msg = `ElevenLabs ${r.status}: ${msg}`;
+  console.error('[voice-api] upstream', msg);
   const status = [401, 402, 403, 429].includes(r.status) ? r.status : 502;
   return json({ error: msg }, status);
 }
@@ -38,13 +40,14 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
   const owns = async (id: string) => {
     if (!VOICE_ID.test(id)) return false;
     const r = await f(`${deps.supabaseUrl}/rest/v1/voices?remote_id=eq.${id}&select=id&limit=1`, { headers: { apikey: deps.anonKey, authorization: req.headers.get('authorization')! } });
-    if (!r.ok) return false;
+    if (!r.ok) { console.error('[voice-api] ownership lookup failed', r.status, await r.text()); return false; }
     const rows = await r.json();
     return Array.isArray(rows) && rows.length > 0;
   };
   const settings = (stability: unknown, similarity: unknown) => ({ stability: clamp01(stability, .5), similarity_boost: clamp01(similarity, .75) });
 
-  const route = new URL(req.url).pathname.split('/').filter(Boolean).pop();
+  const path = new URL(req.url).pathname, route = path.split('/').filter(Boolean).pop();
+  console.log('[voice-api]', req.method, path);
   try {
     if (route === 'clone') {
       const form = await req.formData(), file = form.get('file');
@@ -64,7 +67,7 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
     if (route === 'tts') {
       const b = await req.json(), text = String(b.text ?? '').trim();
       if (!text || text.length > 5000) return json({ error: 'text must be 1–5000 characters' }, 400);
-      if (!(await owns(String(b.voice_id)))) return json({ error: 'voice not found' }, 404);
+      if (!(await owns(String(b.voice_id)))) return json({ error: `voice not found for this account (${route})` }, 404);
       const r = await f(`${EL}/text-to-speech/${b.voice_id}?output_format=mp3_44100_128`, {
         method: 'POST', headers: { ...xi, 'content-type': 'application/json' },
         body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: settings(b.stability, b.similarity) }),
@@ -76,7 +79,7 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       const form = await req.formData(), audio = form.get('audio'), id = String(form.get('voice_id'));
       if (!(audio instanceof Blob) || audio.size === 0) return json({ error: 'audio required' }, 400);
       if (audio.size > MAX_SAMPLE) return json({ error: 'audio too large' }, 413);
-      if (!(await owns(id))) return json({ error: 'voice not found' }, 404);
+      if (!(await owns(id))) return json({ error: `voice not found for this account (${route})` }, 404);
       const up = new FormData();
       up.append('audio', audio, 'input.wav');
       up.set('model_id', 'eleven_multilingual_sts_v2');
@@ -88,14 +91,14 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
 
     if (route === 'delete') {
       const b = await req.json(), id = String(b.voice_id);
-      if (!(await owns(id))) return json({ error: 'voice not found' }, 404);
+      if (!(await owns(id))) return json({ error: `voice not found for this account (${route})` }, 404);
       const r = await f(`${EL}/voices/${id}`, { method: 'DELETE', headers: xi });
       return r.ok || r.status === 404 ? json({ ok: true }) : upstreamError(r);
     }
   } catch (e) {
     return json({ error: e instanceof Error ? e.message : 'bad request' }, 400);
   }
-  return json({ error: 'unknown route' }, 404);
+  return json({ error: `unknown route ${path}` }, 404);
 }
 
 // Guarded so the unit tests can import this file under Node.

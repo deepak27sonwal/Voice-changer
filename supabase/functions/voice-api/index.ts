@@ -17,7 +17,7 @@ const clamp01 = (v: unknown, d: number) => { const n = Number(v); return Number.
 
 async function upstreamError(r: Response): Promise<Response> {
   let msg = 'no details';
-  try { const b = await r.json(); const d = b?.detail; msg = typeof d === 'string' ? d : d?.message || d?.status || JSON.stringify(b).slice(0, 200); } catch { /* keep default */ }
+  try { const b = await r.json(); const d = b?.detail; msg = typeof d === 'string' ? d : [d?.message, d?.status && `[${d.status}]`].filter(Boolean).join(' ') || JSON.stringify(b).slice(0, 200); } catch { /* keep default */ }
   msg = `ElevenLabs ${r.status}: ${msg}`;
   console.error('[voice-api] upstream', msg);
   const status = [401, 402, 403, 429].includes(r.status) ? r.status : 502;

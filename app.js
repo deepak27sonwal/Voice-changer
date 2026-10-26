@@ -110,6 +110,7 @@ const cloud = (() => {
       if (kind) q = q.eq('kind', kind);
       const { data, error } = await q; if (error) throw error; return data;
     },
+    async deleteHistory(id) { await this.fn('history-delete', JSON.stringify({ id })); },
     async historyAudio(path) { const { data, error } = await sb.storage.from('voice-audio').download(path); if (error) throw error; return data; },
     async pull() {
       const [v, r] = await Promise.all([sb.from('voices').select('*').order('created', { ascending: false }), sb.from('recents').select('*').order('ts', { ascending: false }).limit(20)]);
@@ -905,8 +906,9 @@ V.history = () => {
       $('#hist', r).innerHTML = items.length ? items.map((h, i) => `<div class="row hrow" data-i="${i}"><button class="play" data-play aria-label="Play">${icon('play')}</button>
         <div class="info"><strong>${h.kind === 'tts' ? 'Text to Voice' : 'Voice to Voice'} · ${esc(voiceNameFor(h.voice_id))}</strong>
         ${h.text ? `<span class="htext">“${esc(h.text.length > 120 ? h.text.slice(0, 120) + '…' : h.text)}”</span>` : ''}
-        <small>${fmtWhen(h.created_at)}${h.bytes ? ' • ' + fmtSize(h.bytes) : ''}${h.model ? ' • ' + esc(h.model.replace('eleven_', '').replace(/_/g, ' ')) : ''}</small></div>
-        <button class="icon-btn" data-dl aria-label="Download">${icon('download')}</button></div>`).join('')
+        <small>${fmtWhen(h.created_at)}${h.bytes ? ' • ' + fmtSize(h.bytes) : ''}${h.model ? ' • ' + esc(h.model.replace('eleven_', '').replace(/_/g, ' ')) : ''}</small>
+        <div class="hacts"><button class="hact" data-reuse title="${h.kind === 'tts' ? 'Open the text and voice in Text to Voice to edit' : 'Load this audio into Voice to Voice'}">${icon('text')}Reuse</button>
+          <button class="hact" data-dl>${icon('download')}Download</button><button class="hact del" data-del>${icon('trash')}Delete</button></div></div></div>`).join('')
         : '<div class="empty">Nothing here yet – generate speech or convert a voice with an ElevenLabs voice.</div>';
       $$('[data-play]', r).forEach(b => b.onclick = async () => {
         const h = items[+b.closest('.hrow').dataset.i]; if (S.stopPlayback) S.stopPlayback();
@@ -914,6 +916,25 @@ V.history = () => {
         try { src = bufferSource(await decode(await audio(h))); } catch (e) { b.disabled = false; return toast(`Couldn’t load that audio (${String(e.message).slice(0, 50)})`); }
         b.disabled = false; const reset = () => { b.innerHTML = icon('play'); S.stopPlayback = null; };
         const stop = src.play(reset); b.innerHTML = icon('pause'); S.stopPlayback = () => { stop(); reset(); };
+      });
+      $$('[data-reuse]', r).forEach(b => b.onclick = async () => {
+        const h = items[+b.closest('.hrow').dataset.i], voice = allVoices().find(v => v.remote === h.voice_id);
+        if (h.kind === 'tts') {
+          S.tts.text = h.text || ''; if (voice) S.tts.voiceId = voice.id;
+          toast(voice ? 'Loaded – edit the text and generate again' : 'Text loaded – that voice is no longer available, pick another'); return go('tts');
+        }
+        b.disabled = true;
+        try {
+          const s = await loadSample(await audio(h), 1); if (!s) return;
+          S.v2v.sample = s; if (voice) S.v2v.voiceId = voice.id; toast('Audio loaded into Voice to Voice'); go('v2v');
+        } catch (e) { toast(`Couldn’t load that audio (${String(e.message).slice(0, 50)})`); } finally { b.disabled = false; }
+      });
+      $$('[data-del]', r).forEach(b => b.onclick = async () => {
+        const row = b.closest('.hrow'), h = items[+row.dataset.i];
+        if (!confirm('Delete this item from your history? The audio is removed from the server too.')) return;
+        if (S.stopPlayback) S.stopPlayback(); b.disabled = true; row.classList.add('busy');
+        try { await cloud.deleteHistory(h.id); idb.del('hist:' + h.id); items = items.filter(x => x !== h); from = Math.max(0, from - 1); draw(); toast('Deleted from history'); }
+        catch (e) { b.disabled = false; row.classList.remove('busy'); toast(`Couldn’t delete (${String(e.message).slice(0, 60)})`); }
       });
       $$('[data-dl]', r).forEach(b => b.onclick = async () => {
         const h = items[+b.closest('.hrow').dataset.i];

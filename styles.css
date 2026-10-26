@@ -210,3 +210,10 @@ input[type=range] { width: 100%; accent-color: var(--p); }
 .hrow .play { margin-top: 2px; }
 .hrow .info strong { font-size: 14px; }
 .htext { display: block; font-size: 13px; color: var(--ink); margin: 3px 0; overflow-wrap: anywhere; }
+.hacts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.hact { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 99px; padding: 5px 10px; font: 500 12px inherit; font-family: inherit; cursor: pointer; }
+.hact svg.i { width: 14px; height: 14px; }
+.hact:hover { background: var(--soft); }
+.hact.del { color: var(--red); }
+.hact:disabled { opacity: .5; cursor: wait; }
+.hrow.busy { opacity: .5; }

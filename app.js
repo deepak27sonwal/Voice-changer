@@ -118,7 +118,7 @@ const S = {
   recents: ls.get('recents', []),
   draft: null,                  // voice being created: { blob, buf, dur }
   consent: false,
-  tts: { sysVoice: String(ls.get('sysvoice', '')).startsWith('k:') ? '' : ls.get('sysvoice', ''), voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.' },
+  tts: { sysVoice: ls.get('sysvoice', ''), voiceId: null, text: 'Namaste, yeh ek test hai JoloVocals AI Voice Studio ka.' },
   vs: { ...VS_DEFAULTS, ...ls.get('voicesettings', {}) },   // voice control settings, shared by Text to Voice and Voice to Voice
   ttsResult: null, v2v: { sample: null, voiceId: null }, v2vResult: null,
   libTab: 'mine', libQuery: '', stopPlayback: null,

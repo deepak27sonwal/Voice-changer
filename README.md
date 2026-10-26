@@ -9,7 +9,7 @@ Splash → Login/Sign up → Home → Create Voice (upload/record) → Consent �
 
 ## What is real vs. demo
 - **Voice to Voice**: real. Detects the pitch of your audio (autocorrelation), then shifts it toward the target voice's pitch with a duration-preserving WSOLA pitch shifter. Download as WAV.
-- **Create Voice**: records/uploads a sample and stores a *voice profile* (average pitch + the sample) in IndexedDB. This is not neural cloning.
+- **Create Voice**: records/uploads a sample and stores a *voice profile* (average pitch + the sample). With hosted voices on, the sample is also cloned on ElevenLabs (paid ElevenLabs plans only).
 - **Text to Voice**: ElevenLabs speech through the `voice-api` function (see below). Voices without their own ElevenLabs voice (presets, local voices) speak through an ElevenLabs voice of the same gender, shaped toward their pitch and effect. Without ElevenLabs, or if it fails, the browser's SpeechSynthesis is used (not exportable).
 - **Auth** is a local demo (stored in this browser only); Google/mobile sign-in are stubs.
 

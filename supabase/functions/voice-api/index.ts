@@ -4,6 +4,11 @@
 const EL = 'https://api.elevenlabs.io/v1';
 const MAX_SAMPLE = 12 * 1024 * 1024;
 const VOICE_ID = /^[A-Za-z0-9]{10,40}$/;
+// Text tags: [pause 1s] anywhere, and expressive audio tags such as [laughs] or [whispers] (performed by eleven_v3).
+const PAUSE = /\[pause\s*([\d.]+)\s*s\]/gi;
+const EXPRESSIVE = /\[(?!pause\b)[a-z][^\]\n]{0,39}\]/i;
+const forV2 = (t: string) => t.replace(PAUSE, (_, s) => ` <break time="${Math.min(3, Number(s) || .5)}s" /> `).replace(/\[[^\]\n]{1,40}\]/g, '').replace(/\s+/g, ' ').trim();
+const forV3 = (t: string) => t.replace(PAUSE, (_, s) => Number(s) >= 1 ? ' … … ' : ' … ').replace(/\s+/g, ' ').trim();
 
 export interface Deps { elevenKey: string; supabaseUrl: string; anonKey: string; fetch?: typeof fetch }
 
@@ -91,10 +96,19 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       const b = await req.json(), text = String(b.text ?? '').trim();
       if (!text || text.length > 5000) return json({ error: 'text must be 1–5000 characters' }, 400);
       if (!(await usable(String(b.voice_id)))) return json({ error: `voice not found for this account (${route})` }, 404);
-      const r = await f(`${EL}/text-to-speech/${b.voice_id}?output_format=mp3_44100_128`, {
-        method: 'POST', headers: { ...xi, 'content-type': 'application/json' },
-        body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: settings(b) }),
+      const speak = (model: string, body: string, voice_settings: unknown) => f(`${EL}/text-to-speech/${b.voice_id}?output_format=mp3_44100_128`, {
+        method: 'POST', headers: { ...xi, 'content-type': 'application/json' }, body: JSON.stringify({ text: body, model_id: model, voice_settings }),
       });
+      let r: Response;
+      if (EXPRESSIVE.test(text)) {
+        // eleven_v3 performs audio tags; it only accepts stability 0, 0.5 or 1.
+        const vs = settings(b), stability = [0, .5, 1].reduce((p, c) => Math.abs(c - vs.stability) < Math.abs(p - vs.stability) ? c : p);
+        r = await speak('eleven_v3', forV3(text), { stability, similarity_boost: vs.similarity_boost });
+        if (!r.ok && ![401, 429].includes(r.status)) {
+          console.error('[voice-api] eleven_v3 failed, retrying without tags', r.status, (await r.text()).slice(0, 200));
+          r = await speak('eleven_multilingual_v2', forV2(text), settings(b));
+        }
+      } else r = await speak('eleven_multilingual_v2', forV2(text), settings(b));
       return r.ok ? new Response(r.body, { headers: { ...cors, 'content-type': 'audio/mpeg' } }) : upstreamError(r);
     }
 

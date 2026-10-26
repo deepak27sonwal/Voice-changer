@@ -90,3 +90,25 @@ test('sts passes style and speaker boost from the form', async () => {
   await handle(post('sts', f), deps());
   const vs = JSON.parse(calls.at(-1).init.body.get('voice_settings')); assert.equal(vs.style, .3); assert.equal(vs.use_speaker_boost, false);
 });
+test('expressive tags use eleven_v3 with tags kept, pauses as ellipses and stability snapped', async () => {
+  await handle(post('tts', { voice_id: 'abcdefghij123', text: '[excited] Hello! [pause 1s] [laughs] Bye', stability: .7 }), deps());
+  const sent = JSON.parse(calls.at(-1).init.body);
+  assert.equal(sent.model_id, 'eleven_v3'); assert.equal(sent.text, '[excited] Hello! … … [laughs] Bye'); assert.deepEqual(sent.voice_settings, { stability: .5, similarity_boost: .75 });
+});
+test('pause-only text stays on multilingual_v2 with break tags', async () => {
+  await handle(post('tts', { voice_id: 'abcdefghij123', text: 'One [pause 0.5s] two [pause 9s] three' }), deps());
+  const sent = JSON.parse(calls.at(-1).init.body);
+  assert.equal(sent.model_id, 'eleven_multilingual_v2'); assert.equal(sent.text, 'One <break time="0.5s" /> two <break time="3s" /> three');
+});
+test('falls back to multilingual_v2 without tags when eleven_v3 rejects the request', async () => {
+  const seen = [];
+  const d = { ...deps(), fetch: async (u, init = {}) => {
+    if (String(u).endsWith('/auth/v1/user')) return new Response('{}');
+    if (String(u).includes('/rest/')) return new Response('[{"id":1}]');
+    if (String(u).includes('/text-to-speech/')) { const b = JSON.parse(init.body); seen.push(b); return b.model_id === 'eleven_v3' ? new Response('{"detail":"bad model"}', { status: 400 }) : new Response(new Uint8Array([1])); }
+    return new Response('{}');
+  } };
+  const r = await handle(post('tts', { voice_id: 'abcdefghij123', text: '[whispers] secret [pause 1s] done' }), d);
+  assert.equal(r.status, 200); assert.deepEqual(seen.map(x => x.model_id), ['eleven_v3', 'eleven_multilingual_v2']);
+  assert.equal(seen[1].text, 'secret <break time="1s" /> done');
+});

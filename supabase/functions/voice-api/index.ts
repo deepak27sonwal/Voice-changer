@@ -1,5 +1,5 @@
 // JoloVocals hosted voice API: a thin, authenticated proxy to ElevenLabs so the API key never reaches the browser.
-// Routes (POST, signed-in users only): /voices, /clone, /tts, /sts, /delete
+// Routes (POST, signed-in users only): /voices, /clone, /tts, /sts, /delete, /history-delete
 // Single file so it can be pasted straight into the Supabase dashboard editor. Function name: voice-api
 // History: generated audio is saved to our own storage + generation_history table and deleted from ElevenLabs' history.
 const EL = 'https://api.elevenlabs.io/v1';
@@ -168,6 +168,21 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       const since = Math.floor(Date.now() / 1000);
       const r = await f(`${EL}/speech-to-speech/${id}?output_format=mp3_44100_128`, { method: 'POST', headers: xi, body: up });
       return deliver(r, 'sts', id, 'eleven_multilingual_sts_v2', null, since);
+    }
+
+    if (route === 'history-delete') {
+      // Removes one of the caller's own history items: the audio file and the row (service role, scoped to the caller).
+      const b = await req.json(), id = String(b.id ?? '');
+      if (!/^[0-9a-f-]{36}$/i.test(id) || !deps.serviceKey || !user.id) return json({ error: 'history item not found' }, 404);
+      const auth = { apikey: deps.serviceKey, authorization: `Bearer ${deps.serviceKey}` }, own = `id=eq.${id}&user_id=eq.${user.id}`;
+      const q = await f(`${deps.supabaseUrl}/rest/v1/generation_history?${own}&select=audio_path`, { headers: auth });
+      const rows = q.ok ? await q.json() : [];
+      if (!Array.isArray(rows) || !rows.length) return json({ error: 'history item not found' }, 404);
+      const del = await f(`${deps.supabaseUrl}/storage/v1/object/voice-audio`, { method: 'DELETE', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ prefixes: [rows[0].audio_path] }) });
+      if (!del.ok) console.error('[voice-api] history audio delete failed', del.status, await del.text());
+      const d = await f(`${deps.supabaseUrl}/rest/v1/generation_history?${own}`, { method: 'DELETE', headers: { ...auth, prefer: 'return=minimal' } });
+      if (!d.ok) return json({ error: `could not delete history item (${d.status})` }, 500);
+      return json({ ok: true });
     }
 
     if (route === 'delete') {

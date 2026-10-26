@@ -104,6 +104,14 @@ const cloud = (() => {
       if (error) throw error; uid_ = data.session?.user?.id || null; return data;
     },
     signOut: () => safe(() => sb.auth.signOut()).then(() => { uid_ = null; }),
+    /** Server-side generation history (own rows only, via row-level security), newest first. */
+    async history(kind, from, count) {
+      let q = sb.from('generation_history').select('id,kind,voice_id,model,text,characters,audio_path,bytes,created_at').order('created_at', { ascending: false }).range(from, from + count - 1);
+      if (kind) q = q.eq('kind', kind);
+      const { data, error } = await q; if (error) throw error; return data;
+    },
+    async deleteHistory(id) { await this.fn('history-delete', JSON.stringify({ id })); },
+    async historyAudio(path) { const { data, error } = await sb.storage.from('voice-audio').download(path); if (error) throw error; return data; },
     async pull() {
       const [v, r] = await Promise.all([sb.from('voices').select('*').order('created', { ascending: false }), sb.from('recents').select('*').order('ts', { ascending: false }).limit(20)]);
       if (v.error || r.error) return null;
@@ -614,7 +622,7 @@ V.home = () => {
     <div class="menu">${[['tts', 'text', 'Text to Voice', 'Use your cloned voice'], ['v2v', 'wave', 'Voice to Voice', 'Convert your audio'],
       ['create', 'adduser', 'Create Voice', 'Clone a new voice'], ['library', 'lib', 'Voice Library', 'Manage your voices']]
       .map(([r, ic, t, s]) => `<button class="mcard" data-go="${r}"><span class="ic">${icon(ic)}</span><span class="grow"><strong>${t}</strong><small>${s}</small></span>${icon('arrow')}</button>`).join('')}</div>
-    <div class="sec"><span>Recent Audios</span></div>
+    <div class="sec"><span>Recent Audios</span>${cloud.hosted ? '<a href="#/history">See all history</a>' : ''}</div>
     ${items.length ? items.map(a => `<div class="row" data-recent="${a.id}" style="cursor:pointer"><span class="play">${icon('play')}</span><div class="info"><strong>${esc(a.title)}</strong><small>${ago(a.ts)} • ${fmt(a.dur)}</small></div></div>`).join('')
       : '<div class="empty">Nothing yet – generate some speech or convert a voice.</div>'}${nav('home')}</section>`,
   bind: r => $$('[data-recent]', r).forEach(el => el.onclick = () => openRecent(el.dataset.recent)) };
@@ -882,10 +890,76 @@ V['v2v-result'] = () => {
   } };
 };
 
+/* Generation history kept on our server by voice-api (audio in storage, rows in generation_history). */
+const voiceNameFor = id => (S.elVoices.find(v => v.remote === id) || S.voices.find(v => v.remote === id))?.name?.split(' - ')[0] || 'ElevenLabs voice';
+const fmtWhen = iso => { const d = new Date(iso); return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric' }) + ', ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }); };
+const fmtSize = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+V.history = () => {
+  const PAGE = 20; let kind = '', from = 0, items = [];
+  return { html: `<section class="screen">${top('History')}
+    <div class="seg seg3"><button data-k="" class="on">All</button><button data-k="tts">Text to Voice</button><button data-k="sts">Voice to Voice</button></div>
+    <div id="hist"></div><button class="btn ghost" id="more" hidden>Load more</button></section>`,
+  bind: r => {
+    if (!cloud.hosted) { $('#hist', r).innerHTML = '<div class="empty">History is kept on the server when you are signed in with hosted voices on.</div>'; return; }
+    const audio = async h => { let b = await idb.get('hist:' + h.id); if (!b) { b = await cloud.historyAudio(h.audio_path); idb.put('hist:' + h.id, b); } return b; };
+    const draw = () => {
+      $('#hist', r).innerHTML = items.length ? items.map((h, i) => `<div class="row hrow" data-i="${i}"><button class="play" data-play aria-label="Play">${icon('play')}</button>
+        <div class="info"><strong>${h.kind === 'tts' ? 'Text to Voice' : 'Voice to Voice'} · ${esc(voiceNameFor(h.voice_id))}</strong>
+        ${h.text ? `<span class="htext">“${esc(h.text.length > 120 ? h.text.slice(0, 120) + '…' : h.text)}”</span>` : ''}
+        <small>${fmtWhen(h.created_at)}${h.bytes ? ' • ' + fmtSize(h.bytes) : ''}${h.model ? ' • ' + esc(h.model.replace('eleven_', '').replace(/_/g, ' ')) : ''}</small>
+        <div class="hacts"><button class="hact" data-reuse title="${h.kind === 'tts' ? 'Open the text and voice in Text to Voice to edit' : 'Load this audio into Voice to Voice'}">${icon('text')}Reuse</button>
+          <button class="hact" data-dl>${icon('download')}Download</button><button class="hact del" data-del>${icon('trash')}Delete</button></div></div></div>`).join('')
+        : '<div class="empty">Nothing here yet – generate speech or convert a voice with an ElevenLabs voice.</div>';
+      $$('[data-play]', r).forEach(b => b.onclick = async () => {
+        const h = items[+b.closest('.hrow').dataset.i]; if (S.stopPlayback) S.stopPlayback();
+        b.disabled = true; let src;
+        try { src = bufferSource(await decode(await audio(h))); } catch (e) { b.disabled = false; return toast(`Couldn’t load that audio (${String(e.message).slice(0, 50)})`); }
+        b.disabled = false; const reset = () => { b.innerHTML = icon('play'); S.stopPlayback = null; };
+        const stop = src.play(reset); b.innerHTML = icon('pause'); S.stopPlayback = () => { stop(); reset(); };
+      });
+      $$('[data-reuse]', r).forEach(b => b.onclick = async () => {
+        const h = items[+b.closest('.hrow').dataset.i], voice = allVoices().find(v => v.remote === h.voice_id);
+        if (h.kind === 'tts') {
+          S.tts.text = h.text || ''; if (voice) S.tts.voiceId = voice.id;
+          toast(voice ? 'Loaded – edit the text and generate again' : 'Text loaded – that voice is no longer available, pick another'); return go('tts');
+        }
+        b.disabled = true;
+        try {
+          const s = await loadSample(await audio(h), 1); if (!s) return;
+          S.v2v.sample = s; if (voice) S.v2v.voiceId = voice.id; toast('Audio loaded into Voice to Voice'); go('v2v');
+        } catch (e) { toast(`Couldn’t load that audio (${String(e.message).slice(0, 50)})`); } finally { b.disabled = false; }
+      });
+      $$('[data-del]', r).forEach(b => b.onclick = async () => {
+        const row = b.closest('.hrow'), h = items[+row.dataset.i];
+        if (!confirm('Delete this item from your history? The audio is removed from the server too.')) return;
+        if (S.stopPlayback) S.stopPlayback(); b.disabled = true; row.classList.add('busy');
+        try { await cloud.deleteHistory(h.id); idb.del('hist:' + h.id); items = items.filter(x => x !== h); from = Math.max(0, from - 1); draw(); toast('Deleted from history'); }
+        catch (e) { b.disabled = false; row.classList.remove('busy'); toast(`Couldn’t delete (${String(e.message).slice(0, 60)})`); }
+      });
+      $$('[data-dl]', r).forEach(b => b.onclick = async () => {
+        const h = items[+b.closest('.hrow').dataset.i];
+        try { const blob = await audio(h), l = document.createElement('a'); l.href = URL.createObjectURL(blob); l.download = `jolovocals-${h.kind}-${h.created_at.slice(0, 10)}-${h.id.slice(0, 6)}.mp3`; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 1000); }
+        catch (e) { toast(`Couldn’t download (${String(e.message).slice(0, 50)})`); }
+      });
+    };
+    const load = async () => {
+      const more = $('#more', r); more.disabled = true; more.textContent = 'Loading…';
+      if (!items.length) $('#hist', r).innerHTML = '<div class="empty">Loading history…</div>';
+      try { const page = await cloud.history(kind, from, PAGE); items = items.concat(page); from += page.length; more.hidden = page.length < PAGE; draw(); }
+      catch (e) { $('#hist', r).innerHTML = `<div class="empty">Couldn’t load history (${esc(String(e.message).slice(0, 80))})</div>`; more.hidden = true; }
+      more.disabled = false; more.textContent = 'Load more';
+    };
+    $$('.seg button', r).forEach(b => b.onclick = () => { if (S.stopPlayback) S.stopPlayback(); kind = b.dataset.k; from = 0; items = []; $$('.seg button', r).forEach(x => x.classList.toggle('on', x === b)); load(); });
+    $('#more', r).onclick = load;
+    load();
+  } };
+};
+
 V.profile = () => ({
   html: `<section class="screen has-nav">${top('Profile', false)}<div class="center"><div class="okmark" style="background:var(--soft);color:var(--p);width:84px;height:84px">${icon('user')}</div>
     <h2>${esc(S.user.name)}</h2><p class="muted">${esc(S.user.id)}</p><p class="muted">${cloud.on ? '☁ Synced to your account' : 'Stored on this device only'}</p></div><div class="gap"></div>
     <div class="card"><strong>${S.voices.length}</strong> custom voice${S.voices.length === 1 ? '' : 's'} saved on this device</div>
+    ${cloud.hosted ? `<div class="gap"></div><button class="btn ghost" data-go="history">${icon('lib')} Generation history</button>` : ''}
     <div class="grow"></div><button class="btn outline" id="out">Sign out</button><div class="gap"></div><button class="btn outline" id="wipe" style="color:var(--red)">Delete all local data</button>${nav('profile')}</section>`,
   bind: r => {
     $('#out', r).onclick = async () => { await cloud.signOut(); S.user = null; S.elVoices = []; ls.set('user', null); ls.set('elvoices', []); go('login'); };

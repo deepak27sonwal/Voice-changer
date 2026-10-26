@@ -186,3 +186,29 @@ test('failed generations are not saved to history', async () => {
   assert.equal((await handle(post('tts', { voice_id: 'abcdefghij123', text: 'hi' }), d)).status, 401);
   assert.equal(calls.filter(c => c.url.includes('/storage/') || c.url.includes('generation_history')).length, 0);
 });
+
+const HID = '11111111-2222-3333-4444-555555555555';
+const historyStore = owner => async (u, init = {}) => {
+  calls.push({ url: String(u), init });
+  if (String(u).endsWith('/auth/v1/user')) return new Response(JSON.stringify({ id: 'u1' }));
+  if (String(u).includes('/rest/v1/generation_history') && (init.method ?? 'GET') === 'GET')
+    return new Response(JSON.stringify(String(u).includes(`user_id=eq.${owner}`) ? [{ audio_path: `${owner}/history/${HID}.mp3` }] : []));
+  return new Response('{}', { status: 200 });
+};
+test('history-delete removes the caller\'s own audio file and row', async () => {
+  calls.length = 0;
+  const r = await handle(post('history-delete', { id: HID }), histDeps({ fetch: historyStore('u1') }));
+  assert.equal(r.status, 200);
+  const file = calls.find(c => c.url.endsWith('/storage/v1/object/voice-audio') && c.init.method === 'DELETE');
+  assert.deepEqual(JSON.parse(file.init.body), { prefixes: [`u1/history/${HID}.mp3`] });
+  const row = calls.find(c => c.url.includes('/rest/v1/generation_history') && c.init.method === 'DELETE');
+  assert.ok(row.url.includes(`id=eq.${HID}`) && row.url.includes('user_id=eq.u1'));
+});
+test('history-delete refuses items that belong to someone else', async () => {
+  calls.length = 0;
+  const r = await handle(post('history-delete', { id: HID }), histDeps({ fetch: historyStore('someone-else') }));
+  assert.equal(r.status, 404); assert.equal(calls.filter(c => c.init.method === 'DELETE').length, 0);
+});
+test('history-delete rejects malformed ids', async () => {
+  assert.equal((await handle(post('history-delete', { id: '../../x' }), histDeps({ fetch: historyStore('u1') }))).status, 404);
+});

@@ -48,6 +48,42 @@ const idb = (() => {
   return { put: (k, v) => tx('readwrite', s => s.put(v, k)).catch(() => {}), get: k => tx('readonly', s => s.get(k)).catch(() => undefined), del: k => tx('readwrite', s => s.delete(k)).catch(() => {}) };
 })();
 
+/* ───────────── optional Supabase sync (active only when config.js has a key) ───────────── */
+const cloud = (() => {
+  const cfg = window.JV_CONFIG || {}, on = !!(window.supabase && cfg.SUPABASE_URL && cfg.SUPABASE_KEY);
+  const sb = on ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_KEY) : null;
+  let uid_ = null;
+  const safe = async fn => { try { const r = await fn(); if (r?.error) throw r.error; return r; } catch (e) { console.warn('[cloud]', e.message || e); return null; } };
+  const path = f => `${uid_}/${f.replace(':', '-')}`;
+  return {
+    on,
+    async session() { const { data } = await sb.auth.getSession(); const u = data.session?.user || null; uid_ = u?.id || null; return u; },
+    async auth(mode, email, password) {
+      const { data, error } = mode === 'up' ? await sb.auth.signUp({ email, password }) : await sb.auth.signInWithPassword({ email, password });
+      if (error) throw error; uid_ = data.session?.user?.id || null; return data;
+    },
+    signOut: () => safe(() => sb.auth.signOut()).then(() => { uid_ = null; }),
+    async pull() {
+      const [v, r] = await Promise.all([sb.from('voices').select('*').order('created', { ascending: false }), sb.from('recents').select('*').order('ts', { ascending: false }).limit(20)]);
+      if (v.error || r.error) return null;
+      return { voices: v.data.map(({ user_id, ...x }) => x), recents: r.data.map(({ user_id, voice_id, ...x }) => ({ ...x, voiceId: voice_id })) };
+    },
+    upsertVoice: v => on && uid_ && safe(() => sb.from('voices').upsert({ id: v.id, name: v.name, cat: v.cat, pitch: v.pitch, dur: v.dur, created: v.created }, { onConflict: 'user_id,id' })),
+    deleteVoice: id => on && uid_ && safe(() => sb.from('voices').delete().eq('id', id)),
+    upsertRecent: a => on && uid_ && safe(() => sb.from('recents').upsert({ id: a.id, kind: a.kind, title: a.title, text: a.text ?? null, voice_id: a.voiceId ?? null, ts: a.ts, dur: a.dur }, { onConflict: 'user_id,id' })),
+    deleteRecent: id => on && uid_ && safe(() => sb.from('recents').delete().eq('id', id)),
+    putBlob: (key, blob) => on && uid_ && safe(() => sb.storage.from('voice-audio').upload(path(key), blob, { upsert: true, contentType: blob.type || 'audio/wav' })),
+    async getBlob(key) { if (!on || !uid_) return undefined; const r = await safe(() => sb.storage.from('voice-audio').download(path(key))); return r?.data || undefined; },
+    delBlob: key => on && uid_ && safe(() => sb.storage.from('voice-audio').remove([path(key)])),
+  };
+})();
+/** Blob store: IndexedDB as a local cache, Supabase Storage as the source of truth when enabled. */
+const blobs = {
+  put: async (key, blob) => { await idb.put(key, blob); cloud.putBlob(key, blob); },
+  get: async key => (await idb.get(key)) || (await cloud.getBlob(key).then(async b => { if (b) await idb.put(key, b); return b; })),
+  del: key => { idb.del(key); cloud.delBlob(key); },
+};
+
 const PRESETS = [
   { id: 'pre-narrator', name: 'Female Narrator', cat: 'English', pitch: 210, dur: 60, preset: true },
   { id: 'pre-anchor', name: 'News Anchor', cat: 'Hindi', pitch: 115, dur: 60, preset: true },
@@ -234,6 +270,14 @@ const go = r => { location.hash = '#/' + r; };
 
 const V = {};
 
+/** After a cloud sign-in or session restore: set the user and replace local lists with the account's data. */
+async function startSession(u) {
+  const nm = (u.email || 'Friend').split('@')[0];
+  S.user = { id: u.email, name: nm.charAt(0).toUpperCase() + nm.slice(1) }; ls.set('user', S.user);
+  const d = await cloud.pull();
+  if (d) { S.voices = d.voices; S.recents = d.recents; saveVoices(); saveRecents(); }
+}
+
 V.splash = () => ({
   html: `<section class="screen splash"><div class="bars">${[30, 55, 80, 100, 75, 50, 30].map((h, i) => `<span style="height:${h}%;animation-delay:${i * .12}s"></span>`).join('')}</div>
     <div class="brand">Jolo<b>Vocals</b></div><div style="font-size:20px">AI Voice Studio</div><div class="tag">Clone &nbsp;•&nbsp; Convert &nbsp;•&nbsp; Create</div>
@@ -251,11 +295,22 @@ V.login = () => {
     <form id="f"><label class="lbl" style="margin-top:0">Email or phone number</label><input class="field" id="id" placeholder="Enter your email or phone" autocomplete="username" required>
     <label class="lbl">Password</label><input class="field" id="pw" type="password" placeholder="Enter your password" autocomplete="current-password" required minlength="4">
     <div class="gap"></div><button class="btn" id="go">Sign In</button></form>
-    <p class="muted center" style="margin-top:14px">Demo mode: accounts are stored only in this browser.</p></section>`,
+    <p class="muted center" style="margin-top:14px">${cloud.on ? 'Your voices sync to your account.' : 'Demo mode: accounts are stored only in this browser.'}</p></section>`,
   bind: r => {
     $$('[data-demo]', r).forEach(b => b.onclick = () => toast('Social sign-in needs a backend – use email/phone for the demo'));
     $$('.tabs button', r).forEach(b => b.onclick = () => { mode = b.dataset.m; $$('.tabs button', r).forEach(x => x.classList.toggle('on', x === b)); $('#go', r).textContent = mode === 'in' ? 'Sign In' : 'Create Account'; });
-    $('#f', r).onsubmit = e => { e.preventDefault(); const id = $('#id', r).value.trim(), nm = id.includes('@') ? id.split('@')[0] : 'Friend';
+    $('#f', r).onsubmit = async e => { e.preventDefault(); const id = $('#id', r).value.trim(), pw = $('#pw', r).value;
+      if (cloud.on) {
+        if (!id.includes('@')) return toast('Please sign in with your email address');
+        const btn = $('#go', r); btn.disabled = true;
+        try {
+          const d = await cloud.auth(mode, id, pw);
+          if (!d.session) { btn.disabled = false; return toast('Check your email to confirm your account, then sign in'); }
+          await startSession(d.session.user); go('home');
+        } catch (err) { btn.disabled = false; toast(err.message || 'Sign-in failed'); }
+        return;
+      }
+      const nm = id.includes('@') ? id.split('@')[0] : 'Friend';
       S.user = { id, name: nm.charAt(0).toUpperCase() + nm.slice(1) }; ls.set('user', S.user); go('home'); };
   } };
 };
@@ -276,7 +331,7 @@ V.home = () => {
 async function openRecent(id) {
   const a = S.recents.find(x => x.id === id); if (!a) return;
   if (a.kind === 'tts') { S.ttsResult = { text: a.text, voiceId: a.voiceId, id: a.id }; return go('tts-result'); }
-  const blob = await idb.get('audio:' + id); if (!blob) return toast('That audio is no longer stored');
+  const blob = await blobs.get('audio:' + id); if (!blob) return toast('That audio is no longer stored');
   const buf = await decode(blob); S.v2vResult = { id, original: null, converted: buf, blob, ...(S.v2vResult?.id === id ? S.v2vResult : {}) }; go('v2v-result');
 }
 
@@ -345,7 +400,7 @@ V.created = () => ({
     $('#save', r).onclick = () => {
       const name = $('#name', r).value.trim(); if (!name) return toast('Please enter a name');
       const v = { id: d.tmpId, name, cat: $('#cat', r).value, pitch: d.pitch || 150, dur: d.dur, created: Date.now() };
-      S.voices.unshift(v); saveVoices(); S.draft = null; toast('Voice saved'); go('library');
+      S.voices.unshift(v); saveVoices(); cloud.upsertVoice(v); cloud.putBlob('sample:' + v.id, d.blob); S.draft = null; toast('Voice saved'); go('library');
     };
   } });
 
@@ -362,14 +417,14 @@ V.library = () => ({
         : `<div class="empty">${S.libTab === 'mine' ? 'No voices yet – create your first one.' : 'No matching voices.'}</div>`;
       $$('[data-play]', r).forEach(b => b.onclick = async () => {
         const v = findVoice(b.closest('.row').dataset.id); if (S.stopPlayback) S.stopPlayback();
-        const sample = v.preset ? null : await idb.get('sample:' + v.id), src = sample ? bufferSource(await decode(sample)) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1);
+        const sample = v.preset ? null : await blobs.get('sample:' + v.id), src = sample ? bufferSource(await decode(sample)) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1);
         let stop; const reset = () => { b.innerHTML = icon('play'); S.stopPlayback = null; };
         stop = src.play(reset); b.innerHTML = icon('pause'); S.stopPlayback = () => { stop(); reset(); };
       });
       $$('[data-menu]', r).forEach(b => b.onclick = async () => {
         const v = findVoice(b.closest('.row').dataset.id), a = prompt(`"${v.name}" – type "rename" or "delete"`, 'rename'); if (!a) return;
-        if (a.toLowerCase() === 'delete' && confirm(`Delete ${v.name}?`)) { S.voices = S.voices.filter(x => x.id !== v.id); saveVoices(); idb.del('sample:' + v.id); }
-        else if (a.toLowerCase() === 'rename') { const n = prompt('New name', v.name); if (n && n.trim()) { v.name = n.trim().slice(0, 40); saveVoices(); } }
+        if (a.toLowerCase() === 'delete' && confirm(`Delete ${v.name}?`)) { S.voices = S.voices.filter(x => x.id !== v.id); saveVoices(); cloud.deleteVoice(v.id); blobs.del('sample:' + v.id); }
+        else if (a.toLowerCase() === 'rename') { const n = prompt('New name', v.name); if (n && n.trim()) { v.name = n.trim().slice(0, 40); saveVoices(); cloud.upsertVoice(v); } }
         draw();
       });
     };
@@ -411,11 +466,11 @@ V['tts-result'] = () => {
     <div class="grow"></div><button class="btn" id="again">Generate Again</button></section>`,
   bind: r => {
     const p = bindPlayer($('.player', r), async () => src);
-    if (res.fresh) { res.fresh = false; S.recents.unshift({ id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }); saveRecents(); }
+    if (res.fresh) { res.fresh = false; const item = { id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); }
     setTimeout(() => $('.play', r)?.click(), 250);
     $('#again', r).onclick = () => { p(); $('.play', r).click(); };
     $('#sh', r).onclick = () => navigator.share ? navigator.share({ title: 'JoloVocals', text: res.text }).catch(() => {}) : navigator.clipboard?.writeText(res.text).then(() => toast('Text copied'));
-    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); S.ttsResult = null; go('tts'); };
+    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); S.ttsResult = null; go('tts'); };
     $('#dl', r).onclick = () => toast('Downloads need a server-side TTS engine');
   } };
 };
@@ -437,9 +492,9 @@ V.v2v = () => {
         const srcPitch = detectPitch(st.sample.buf); if (!srcPitch) toast('Couldn’t detect the pitch of your audio – converting at neutral');
         const ratio = srcPitch ? clamp((voice.pitch || 150) / srcPitch, .5, 2) : 1, { data, sr } = pitchShift(st.sample.buf, ratio);
         const out = ac().createBuffer(1, data.length, sr); out.copyToChannel(data, 0);
-        const id = uid(), blob = encodeWav(data, sr); await idb.put('audio:' + id, blob);
+        const id = uid(), blob = encodeWav(data, sr); await blobs.put('audio:' + id, blob);
         S.v2vResult = { id, original: st.sample.buf, converted: out, blob, voice: voice.name };
-        S.recents.unshift({ id, kind: 'v2v', title: `Converted to ${voice.name}`, ts: Date.now(), dur: out.duration }); saveRecents(); go('v2v-result');
+        const item = { id, kind: 'v2v', title: `Converted to ${voice.name}`, ts: Date.now(), dur: out.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); go('v2v-result');
       } catch (e) { console.error(e); toast('Conversion failed'); btn.disabled = false; btn.textContent = 'Convert Audio'; }
     };
   } };
@@ -461,18 +516,18 @@ V['v2v-result'] = () => {
     $('#dl', r).onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(res.blob); a.download = `jolovocals-${res.id}.wav`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
     $('#sh', r).onclick = async () => { const f = new File([res.blob], 'jolovocals.wav', { type: 'audio/wav' });
       if (navigator.canShare?.({ files: [f] })) navigator.share({ files: [f] }).catch(() => {}); else toast('Sharing files isn’t supported here – use Download'); };
-    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); idb.del('audio:' + res.id); S.v2vResult = null; go('v2v'); };
+    $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); blobs.del('audio:' + res.id); S.v2vResult = null; go('v2v'); };
     $('#more', r).onclick = () => { S.v2v.sample = null; go('v2v'); };
   } };
 };
 
 V.profile = () => ({
   html: `<section class="screen has-nav">${top('Profile', false)}<div class="center"><div class="okmark" style="background:var(--soft);color:var(--p);width:84px;height:84px">${icon('user')}</div>
-    <h2>${esc(S.user.name)}</h2><p class="muted">${esc(S.user.id)}</p></div><div class="gap"></div>
+    <h2>${esc(S.user.name)}</h2><p class="muted">${esc(S.user.id)}</p><p class="muted">${cloud.on ? '☁ Synced to your account' : 'Stored on this device only'}</p></div><div class="gap"></div>
     <div class="card"><strong>${S.voices.length}</strong> custom voice${S.voices.length === 1 ? '' : 's'} saved on this device</div>
     <div class="grow"></div><button class="btn outline" id="out">Sign out</button><div class="gap"></div><button class="btn outline" id="wipe" style="color:var(--red)">Delete all local data</button>${nav('profile')}</section>`,
   bind: r => {
-    $('#out', r).onclick = () => { S.user = null; ls.set('user', null); go('login'); };
+    $('#out', r).onclick = async () => { await cloud.signOut(); S.user = null; ls.set('user', null); go('login'); };
     $('#wipe', r).onclick = () => { if (!confirm('Delete all voices, audio and your account from this browser?')) return;
       indexedDB.deleteDatabase('jolovocals'); ['user', 'voices', 'recents'].forEach(k => localStorage.removeItem('jv.' + k)); location.hash = '#/splash'; location.reload(); };
   } });
@@ -494,5 +549,11 @@ function render() {
 }
 window.addEventListener('hashchange', render);
 speechSynthesis?.getVoices();
-render();
+(async () => {
+  if (cloud.on) {
+    const u = await cloud.session().catch(() => null);
+    if (u) await startSession(u); else if (S.user) { S.user = null; ls.set('user', null); }
+  }
+  render();
+})();
 })();

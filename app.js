@@ -123,13 +123,19 @@ const S = {
   elVoices: ls.get('elvoices', []),   // voices from the ElevenLabs account (hosted mode)
 };
 const allVoices = () => [...S.voices, ...S.elVoices, ...PRESETS];
+const LANGS = { hi: 'Hindi', en: 'English', kn: 'Kannada', ta: 'Tamil', te: 'Telugu', mr: 'Marathi', bn: 'Bengali', pt: 'Portuguese', de: 'German', nl: 'Dutch', it: 'Italian', tr: 'Turkish' };
+/** Best ElevenLabs Hindi voice for a gender (skips character/kids voices); undefined if none. */
+const hindiElVoice = male => {
+  const pool = S.elVoices.filter(v => v.lang === 'hi' && v.gender === (male ? 'male' : 'female'));
+  return pool.find(v => !/kids|character|story/i.test(v.name)) || pool[0];
+};
 /** Fetch the ElevenLabs account's own voices through voice-api; re-render screens that list voices. */
 async function loadElVoices() {
   if (!cloud.hosted || !S.user) return;
   try {
     const { voices } = await (await cloud.fn('voices', '{}')).json();
     S.elVoices = voices.map(v => ({ id: 'el-' + v.voice_id, remote: v.voice_id, name: v.name, preview: v.preview_url, gender: v.gender === 'male' || v.gender === 'female' ? v.gender : undefined,
-      cat: ['ElevenLabs', v.language, v.accent].filter(Boolean).join(' • '), dur: 0, preset: true, el: true }));
+      lang: v.language, cat: ['ElevenLabs', LANGS[v.language] || v.language].filter(Boolean).join(' • '), dur: 0, preset: true, el: true }));
     ls.set('elvoices', S.elVoices);
     if (['#/tts', '#/v2v', '#/library'].includes(location.hash)) render();
   } catch (e) { console.warn('[elevenlabs voices]', e); }
@@ -478,8 +484,13 @@ const baseVoiceDropdown = (id, sel) => {
   const neural = KVOICES.map(v => ({ value: 'k:' + v.id, label: `${v.name} (${v.gender})`, sub: `${v.acc} English • neural` }));
   return ddHtml(id, [{ items: [{ value: '', label: 'Automatic', sub: 'neural voice matching male/female' }] }, { title: 'Neural voices', items: neural }, ...(dev.length ? [{ title: 'Device voices (offline)', items: dev }] : [])], sel);
 };
-const voiceItem = v => ({ value: v.id, label: v.name, sub: `${v.cat}${v.pitch ? ` • ${v.pitch} Hz` : ''}${v.fx ? ` • ${v.fx}` : ''}` });
-const voiceDropdown = (id, sel) => ddHtml(id, [...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(voiceItem) }] : []), ...(S.elVoices.length ? [{ title: 'ElevenLabs voices', items: S.elVoices.map(voiceItem) }] : []), { title: 'Preset voices', items: PRESETS.map(voiceItem) }], sel);
+const voiceItem = v => ({ value: v.id, label: v.name, sub: `${v.gender && v.el ? v.gender + ' • ' : ''}${v.cat}${v.pitch ? ` • ${v.pitch} Hz` : ''}${v.fx ? ` • ${v.fx}` : ''}` });
+const voiceDropdown = (id, sel) => {
+  const hi = S.elVoices.filter(v => v.lang === 'hi'), other = S.elVoices.filter(v => v.lang !== 'hi');
+  return ddHtml(id, [...(S.voices.length ? [{ title: 'My voices', items: S.voices.map(voiceItem) }] : []),
+    ...(hi.length ? [{ title: 'ElevenLabs · Hindi', items: hi.map(voiceItem) }] : []), ...(other.length ? [{ title: 'ElevenLabs voices', items: other.map(voiceItem) }] : []),
+    { title: 'Preset voices', items: PRESETS.map(voiceItem) }], sel);
+};
 const go = r => { location.hash = '#/' + r; };
 
 const V = {};
@@ -689,17 +700,20 @@ V['tts-result'] = () => {
     <button class="btn outline" id="usedev">Use device voice instead</button><div class="gap"></div><button class="btn ghost" id="cancel">Cancel</button></div></section>`,
   bind: async r => {
     const body = $('#body', r), gone = () => !r.isConnected;
-    let cancelled = false, device = false, buf = res.buf, blob = res.blob;
+    let cancelled = false, device = false, buf = res.buf, blob = res.blob, hindiEl = null;
     const t0 = Date.now(), tick = setInterval(() => { if (gone()) return clearInterval(tick); $('#elapsed', r).textContent = `${Math.round((Date.now() - t0) / 1000)} s`; }, 500);
     const status = (t, f) => { if (gone()) return; $('#status', r).textContent = t; if (f != null) $('#barfill', r).style.width = Math.round(f * 100) + '%'; };
     if (!buf) {
       $('#cancel', r).onclick = () => { cancelled = true; neural.reset(); go('tts'); };
       $('#usedev', r).onclick = () => { device = true; neural.reset(); startDevice(); };
       let startDevice = () => {};
-      if (v.remote && cloud.hosted) {
+      // Hindi without a hosted voice of its own → use the account's ElevenLabs Hindi voice of the same gender
+      hindiEl = !v.remote && cloud.hosted && (v.cat === 'Hindi' || /[\u0900-\u097F]/.test(res.text)) ? hindiElVoice(isMale(v)) : null;
+      const hostedId = v.remote || hindiEl?.remote;
+      if (hostedId) {
         try {
           status('Generating with your cloned voice…', .3);
-          blob = await (await cloud.fn('tts', JSON.stringify({ voice_id: v.remote, text: res.text, stability: S.tts.stability, similarity: S.tts.similarity }))).blob();
+          blob = await (await cloud.fn('tts', JSON.stringify({ voice_id: hostedId, text: res.text, stability: S.tts.stability, similarity: S.tts.similarity }))).blob();
           buf = await decode(blob);
         } catch (e) { if (cancelled) return; blob = null; toast(`Hosted voice unavailable (${String(e.message).slice(0, 60)}) – using the built-in voice`); }
       }
@@ -720,7 +734,7 @@ V['tts-result'] = () => {
     if (gone()) return;
     const src = device ? speakSource(res.text, v, S.tts.stability, S.tts.similarity, S.tts.sysVoice.startsWith('k:') ? '' : S.tts.sysVoice) : bufferSource(buf);
     body.innerHTML = `<div class="player">${playerHtml(device ? fakePeaks(res.text.length) : peaks(buf), src.duration, true)}</div>
-      <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${device ? ' (device voice)' : ''}</p>
+      <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${hindiEl && buf ? ` (ElevenLabs ${esc(hindiEl.name.split(' - ')[0])})` : ''}${device ? ' (device voice)' : ''}</p>
       <div class="actions"><button class="act" id="dl" ${device ? 'disabled' : ''}>${icon('download')}Download</button>
         <button class="act" id="sh">${icon('share')}Share</button><button class="act del" id="rm">${icon('trash')}Delete</button></div>
       <button class="btn" id="again">Generate Again</button>`;

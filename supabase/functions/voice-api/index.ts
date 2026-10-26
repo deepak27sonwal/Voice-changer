@@ -1,5 +1,5 @@
 // JoloVocals hosted voice API: a thin, authenticated proxy to ElevenLabs so the API key never reaches the browser.
-// Routes (POST, signed-in users only): /clone, /tts, /sts, /delete
+// Routes (POST, signed-in users only): /voices, /clone, /tts, /sts, /delete
 // Single file so it can be pasted straight into the Supabase dashboard editor. Function name: voice-api
 const EL = 'https://api.elevenlabs.io/v1';
 const MAX_SAMPLE = 12 * 1024 * 1024;
@@ -44,11 +44,27 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
     const rows = await r.json();
     return Array.isArray(rows) && rows.length > 0;
   };
+  // Voices in the ElevenLabs account itself (premade + saved library voices) may be used by any signed-in user.
+  let accountVoices: { voice_id: string; name: string; category: string; labels: Record<string, string>; preview_url: string }[] | null = null;
+  const listAccountVoices = async () => {
+    if (accountVoices) return accountVoices;
+    const r = await f(`${EL}/voices`, { headers: xi });
+    if (!r.ok) { console.error('[voice-api] voice list failed', r.status); return []; }
+    const b = await r.json();
+    return accountVoices = (b.voices ?? []).filter((v: { category?: string }) => v.category !== 'cloned');
+  };
+  const usable = async (id: string) => VOICE_ID.test(id) && ((await owns(id)) || (await listAccountVoices()).some(v => v.voice_id === id));
   const settings = (stability: unknown, similarity: unknown) => ({ stability: clamp01(stability, .5), similarity_boost: clamp01(similarity, .75) });
 
   const path = new URL(req.url).pathname, route = path.split('/').filter(Boolean).pop();
   console.log('[voice-api]', req.method, path);
   try {
+    if (route === 'voices') {
+      const list = await listAccountVoices();
+      return json({ voices: list.map(v => ({ voice_id: v.voice_id, name: v.name, category: v.category, preview_url: v.preview_url,
+        gender: v.labels?.gender ?? null, language: v.labels?.language ?? null, accent: v.labels?.accent ?? null })) });
+    }
+
     if (route === 'clone') {
       const form = await req.formData(), file = form.get('file');
       if (!(file instanceof Blob) || file.size === 0) return json({ error: 'audio sample required' }, 400);
@@ -67,7 +83,7 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
     if (route === 'tts') {
       const b = await req.json(), text = String(b.text ?? '').trim();
       if (!text || text.length > 5000) return json({ error: 'text must be 1–5000 characters' }, 400);
-      if (!(await owns(String(b.voice_id)))) return json({ error: `voice not found for this account (${route})` }, 404);
+      if (!(await usable(String(b.voice_id)))) return json({ error: `voice not found for this account (${route})` }, 404);
       const r = await f(`${EL}/text-to-speech/${b.voice_id}?output_format=mp3_44100_128`, {
         method: 'POST', headers: { ...xi, 'content-type': 'application/json' },
         body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: settings(b.stability, b.similarity) }),
@@ -79,7 +95,7 @@ export async function handle(req: Request, deps: Deps): Promise<Response> {
       const form = await req.formData(), audio = form.get('audio'), id = String(form.get('voice_id'));
       if (!(audio instanceof Blob) || audio.size === 0) return json({ error: 'audio required' }, 400);
       if (audio.size > MAX_SAMPLE) return json({ error: 'audio too large' }, 413);
-      if (!(await owns(id))) return json({ error: `voice not found for this account (${route})` }, 404);
+      if (!(await usable(id))) return json({ error: `voice not found for this account (${route})` }, 404);
       const up = new FormData();
       up.append('audio', audio, 'input.wav');
       up.set('model_id', 'eleven_multilingual_sts_v2');

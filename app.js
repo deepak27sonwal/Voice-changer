@@ -402,7 +402,7 @@ function bindCapture(root, onBlob, maxSec) {
   if (drop) { drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); }; drop.ondragleave = () => drop.classList.remove('over');
     drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); const f = e.dataTransfer.files[0]; if (f) onBlob(f); }; }
   let session = null, t0 = 0, tick = null;
-  const finish = async () => { clearInterval(tick); recBtn.classList.remove('live'); const s = session; session = null; if (s) onBlob(await s.stop()); };
+  const finish = async () => { clearInterval(tick); recBtn.classList.remove('live'); const s = session; session = null; if (s) onBlob(await s.stop(), true); };
   recBtn.onclick = async () => {
     if (session) return finish();
     try { session = await startRecording(); } catch { return toast('Microphone unavailable – allow access or upload a file'); }
@@ -543,14 +543,15 @@ V.create = () => {
     <div class="grow"></div><div class="gap"></div><button class="btn" id="next" ${d ? '' : 'disabled'}>Continue</button></section>`,
   bind: r => {
     let halt;
-    const show = () => { $('#chosen', r).innerHTML = chosenHtml(S.draft); $('#next', r).disabled = false; halt = bindPlayer($('.filechip', r), async () => bufferSource(S.draft.buf)); };
+    const show = () => { $('#chosen', r).innerHTML = chosenHtml(S.draft); $('#next', r).disabled = false; halt = bindPlayer($('.filechip', r), async () => bufferSource(S.draft.buf));
+      $('.retake', r).onclick = () => { const again = S.draft.rec; halt(); S.draft = null; $('#chosen', r).innerHTML = ''; $('#next', r).disabled = true; $('.rec-time', r).textContent = `00:00 / ${fmt(300)}`; if (again) $('.rec', r).click(); }; };
     if (d) show();
-    const stopRec = bindCapture(r, async blob => { const s = await loadSample(blob, 3); if (!s) return; if (s.dur < 60) toast('Tip: 1–5 minutes gives the best profile'); S.draft = s; show(); }, 300);
+    const stopRec = bindCapture(r, async (blob, rec) => { const s = await loadSample(blob, 3); if (!s) return; if (s.dur < 60) toast('Tip: 1–5 minutes gives the best profile'); s.rec = rec; S.draft = s; show(); }, 300);
     $('#next', r).onclick = () => { stopRec(); go('consent'); };
     r._cleanup = () => { stopRec(); halt && halt(); };
   } };
 };
-const chosenHtml = d => `<div class="filechip" style="display:block">${playerHtml(peaks(d.buf, 30), d.dur)}</div>`;
+const chosenHtml = d => `<div class="filechip" style="display:block">${playerHtml(peaks(d.buf, 30), d.dur)}<button type="button" class="btn outline retake" style="margin-top:12px">↺ Retake</button></div>`;
 
 V.consent = () => ({
   html: `<section class="screen">${top('Voice Consent')}<div class="consent"><div class="ic">${icon('doc')}</div><h2>Confirm Permission</h2>
@@ -723,9 +724,10 @@ V.v2v = () => {
     <label class="lbl">Target Voice</label>${voiceDropdown('v', st.voiceId)}
     <div class="grow"></div><div class="gap"></div><button class="btn" id="conv" ${st.sample ? '' : 'disabled'}>${icon('wave')} Convert Audio</button>${nav('v2v')}</section>`,
   bind: r => {
-    const show = () => { $('#chosen', r).innerHTML = chosenHtml(st.sample); $('#conv', r).disabled = false; bindPlayer($('.filechip', r), async () => bufferSource(st.sample.buf)); };
+    const show = () => { $('#chosen', r).innerHTML = chosenHtml(st.sample); $('#conv', r).disabled = false; const halt = bindPlayer($('.filechip', r), async () => bufferSource(st.sample.buf));
+      $('.retake', r).onclick = () => { const again = st.sample.rec; halt(); st.sample = null; $('#chosen', r).innerHTML = ''; $('#conv', r).disabled = true; $('.rec-time', r).textContent = `00:00 / ${fmt(120)}`; if (again) $('.rec', r).click(); }; };
     if (st.sample) show();
-    const stopRec = bindCapture(r, async blob => { const s = await loadSample(blob, 1); if (s) { st.sample = s; show(); } }, 120);
+    const stopRec = bindCapture(r, async (blob, rec) => { const s = await loadSample(blob, 1); if (s) { s.rec = rec; st.sample = s; show(); } }, 120);
     $('#v', r).onchange = e => { st.voiceId = e.target.value; };
     $('#conv', r).onclick = async () => {
       const btn = $('#conv', r), voice = findVoice(st.voiceId); btn.disabled = true; btn.textContent = 'Converting…'; stopRec(); await sleep(30);

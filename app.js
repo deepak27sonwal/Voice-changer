@@ -699,7 +699,8 @@ function hostedWithProgress(pl, path, body, expectSec, ctl, waitLabel) {
 }
 
 /* ───────────── views ───────────── */
-const nav = on => `<nav class="bottom">
+const TABS = ['home', 'tts', 'v2v', 'library', 'profile'];
+const nav = on => `<nav class="bottom"><span class="ind" aria-hidden="true"></span>
   ${[['home', 'home', 'Home'], ['tts', 'text', 'Generate']].map(([r, ic, l]) => `<button data-go="${r}" class="${on === r ? 'on' : ''}">${icon(ic)}${l}</button>`).join('')}
   <button class="mic ${on === 'v2v' ? 'on' : ''}" data-go="v2v" aria-label="Voice to voice">${icon('mic')}<span class="nav-l">Voice to Voice</span></button>
   ${[['library', 'lib', 'Library'], ['profile', 'user', 'Profile']].map(([r, ic, l]) => `<button data-go="${r}" class="${on === r ? 'on' : ''}">${icon(ic)}${l}</button>`).join('')}</nav>`;
@@ -712,7 +713,7 @@ const ddHtml = (id, groups, sel) => {
       const text = `<span>${esc(o.label)}</span>${o.sub ? `<small>${esc(o.sub)}</small>` : ''}`;
       return o.acts
         ? `<li role="option" tabindex="-1" class="has-acts" data-v="${esc(o.value)}" aria-selected="${o.value === cur.value}"><span class="dd-text">${text}</span><span class="dd-acts">
-            <button type="button" class="dd-act" data-prev="${esc(o.value)}" tabindex="-1" aria-label="Preview ${esc(o.label)}">▶</button>
+            <button type="button" class="dd-act" data-prev="${esc(o.value)}" tabindex="-1" aria-label="Preview ${esc(o.label)}">${PREV_PLAY}</button>
             <button type="button" class="dd-act star" data-fav="${esc(o.value)}" tabindex="-1" aria-pressed="${!!o.fav}" aria-label="Favourite ${esc(o.label)}">★</button></span></li>`
         : `<li role="option" tabindex="-1" data-v="${esc(o.value)}" aria-selected="${o.value === cur.value}">${text}</li>`;
     }).join('')).join('')}</ul></div>`;
@@ -725,7 +726,7 @@ function bindDropdowns(root) {
     const open = () => { $$('.dd-list').forEach(l => { l.hidden = true; }); list.hidden = false; btn.setAttribute('aria-expanded', 'true');
       const s = $('[aria-selected=true]', dd); s?.scrollIntoView({ block: 'nearest' }); s?.focus(); };
     const pick = o => { dd.dataset.value = o.dataset.v; opts.forEach(x => x.setAttribute('aria-selected', x.dataset.v === o.dataset.v));
-      $('.dd-label', dd).innerHTML = ($('.dd-text', o) || o).innerHTML; close(); btn.focus(); dd.dispatchEvent(new Event('change')); };
+      $('.dd-label', dd).innerHTML = ($('.dd-text', o) || o).innerHTML; close(); btn.focus(); flash(btn, 'picked'); dd.dispatchEvent(new Event('change')); };
     btn.onclick = () => list.hidden ? open() : close();
     opts.forEach(o => { o.onclick = e => { if (!e.target.closest('.dd-act')) pick(o); };
       o.onkeydown = e => { const i = opts.indexOf(o);
@@ -756,14 +757,19 @@ async function previewVoice(v, btn) {
   if (sample) src = bufferSource(await decode(sample));
   else if (v.preview) src = urlSource(v.preview);
   else { const si = cloud.hosted && !v.remote ? elVoiceFor(isMale(v), v.cat === 'Hindi') : null; src = si?.preview ? urlSource(si.preview) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1); }
-  const label = btn.innerHTML; btn.classList.add('playing'); btn.innerHTML = '■';
+  const label = btn.innerHTML; btn.classList.add('playing'); btn.innerHTML = PREV_STOP;
   const reset = () => { btn.classList.remove('playing'); btn.innerHTML = label; S.stopPlayback = null; };
   const stop = src.play(reset); S.stopPlayback = () => { stop(); reset(); };
 }
+// Preview button glyphs; the triangle sits slightly right of centre so it looks centred.
+const PREV_PLAY = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13L18.5 12z"/></svg>';
+const PREV_STOP = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/></svg>';
+/** Replays a one-shot CSS animation class on `el`. */
+const flash = (el, cls) => { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); setTimeout(() => el.classList.remove(cls), 500); };
 // Star / preview buttons anywhere (dropdowns, library); capture phase so they never select the dropdown option.
 document.addEventListener('click', e => {
   const fav = e.target.closest('[data-fav]'), prev = e.target.closest('[data-prev]');
-  if (fav) { e.stopPropagation(); const on = toggleFav(fav.dataset.fav); $$('[data-fav]').forEach(b => { if (b.dataset.fav === fav.dataset.fav) b.setAttribute('aria-pressed', on); }); toast(on ? '★ Added to favourites' : 'Removed from favourites'); }
+  if (fav) { e.stopPropagation(); const on = toggleFav(fav.dataset.fav); $$('[data-fav]').forEach(b => { if (b.dataset.fav === fav.dataset.fav) b.setAttribute('aria-pressed', on); }); flash(fav, 'pop'); toast(on ? '★ Added to favourites' : 'Removed from favourites'); }
   else if (prev) { e.stopPropagation(); previewVoice(findVoice(prev.dataset.prev), prev); }
 }, true);
 const voiceDropdown = (id, sel) => {
@@ -1379,15 +1385,45 @@ function render() {
   const app = $('#app'); if (app._cleanup) app._cleanup();
   if (!V[name]) return go('splash');
   if (!PUBLIC.has(name) && !S.user) return go('login');
+  const prev = $('.screen', app), dir = S.navSlide && S.navSlide[1] === name ? S.navSlide[0] : 0, fromTab = S.navFrom; S.navSlide = null;
   const view = V[name](); app.innerHTML = view.html; app._cleanup = null;
-  $$('[data-go]', app).forEach(b => b.onclick = () => go(b.dataset.go));
+  const bar = $('.screen > nav.bottom', app); if (bar) app.appendChild(bar);   // outside the screen so slides don't move it
+  S.navFrom = TABS.includes(name) ? name : null;
+  $$('[data-go]', app).forEach(b => b.onclick = () => {
+    const from = TABS.indexOf(S.navFrom), to = TABS.indexOf(b.dataset.go);
+    if (b.closest('nav.bottom') && from >= 0 && to >= 0 && from !== to) S.navSlide = [Math.sign(to - from), b.dataset.go];
+    go(b.dataset.go);
+  });
   $$('[data-back]', app).forEach(b => b.onclick = () => history.length > 1 ? history.back() : go('home'));
   $$('[data-install]', app).forEach(b => b.onclick = async () => { if (!installEvt) return; installEvt.prompt(); await installEvt.userChoice.catch(() => {}); installEvt = null; $$('[data-install]').forEach(x => { x.hidden = true; }); });
   document.body.classList.toggle('with-nav', !!$('nav.bottom', app));
+  const next = $('.screen', app), y = window.scrollY;
   bindDropdowns(app); const c = view.bind(app); app.scrollTo?.(0, 0); window.scrollTo(0, 0);
+  if (dir && prev && next?.isConnected && !matchMedia('(prefers-reduced-motion: reduce)').matches) slideScreens(app, prev, next, dir, y);
+  if (bar?.isConnected) moveNavInd(bar, fromTab);
   if (c && c.catch) c.catch(console.error);
 }
+/** Slides the old screen out and the new one in; `dir` 1 = to a tab on the right/below, -1 = to the left/above. */
+function slideScreens(app, prev, next, dir, y) {
+  prev.querySelectorAll('[id]').forEach(e => e.removeAttribute('id'));
+  prev.style.top = -y + 'px';
+  prev.classList.add('leaving', dir > 0 ? 'to-l' : 'to-r'); prev.setAttribute('aria-hidden', 'true'); prev.inert = true;
+  next.classList.add(dir > 0 ? 'from-r' : 'from-l');
+  app.classList.add('sliding'); app.appendChild(prev);
+  const done = () => { prev.remove(); next.classList.remove('from-r', 'from-l'); if (!$('.screen.leaving', app)) app.classList.remove('sliding'); };
+  prev.addEventListener('animationend', done, { once: true }); setTimeout(done, 600);
+}
+/** Glides the nav indicator from the previously active tab to the current one. */
+function moveNavInd(bar, fromTab) {
+  const ind = $('.ind', bar), cur = $('button.on', bar), from = fromTab && $(`button[data-go="${fromTab}"]`, bar);
+  if (!cur) return;
+  const place = b => { ind.style.setProperty('--x', b.offsetLeft + 'px'); ind.style.setProperty('--y', b.offsetTop + 'px');
+    ind.style.setProperty('--w', b.offsetWidth + 'px'); ind.style.setProperty('--h', b.offsetHeight + 'px'); ind.classList.toggle('at-mic', b.classList.contains('mic')); };
+  ind.style.transition = 'none'; place(from || cur); bar.classList.add('has-ind');
+  void ind.offsetWidth; ind.style.transition = ''; place(cur);
+}
 window.addEventListener('hashchange', render);
+window.addEventListener('resize', () => { const bar = $('#app > nav.bottom'); if (bar) moveNavInd(bar, null); });
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(e => console.warn('[sw]', e));
 speechSynthesis?.getVoices();
 (async () => {

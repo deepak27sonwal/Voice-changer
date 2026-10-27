@@ -699,7 +699,8 @@ function hostedWithProgress(pl, path, body, expectSec, ctl, waitLabel) {
 }
 
 /* ───────────── views ───────────── */
-const nav = on => `<nav class="bottom">
+const TABS = ['home', 'tts', 'v2v', 'library', 'profile'];
+const nav = on => `<nav class="bottom"><span class="ind" aria-hidden="true"></span>
   ${[['home', 'home', 'Home'], ['tts', 'text', 'Generate']].map(([r, ic, l]) => `<button data-go="${r}" class="${on === r ? 'on' : ''}">${icon(ic)}${l}</button>`).join('')}
   <button class="mic ${on === 'v2v' ? 'on' : ''}" data-go="v2v" aria-label="Voice to voice">${icon('mic')}<span class="nav-l">Voice to Voice</span></button>
   ${[['library', 'lib', 'Library'], ['profile', 'user', 'Profile']].map(([r, ic, l]) => `<button data-go="${r}" class="${on === r ? 'on' : ''}">${icon(ic)}${l}</button>`).join('')}</nav>`;
@@ -1379,15 +1380,45 @@ function render() {
   const app = $('#app'); if (app._cleanup) app._cleanup();
   if (!V[name]) return go('splash');
   if (!PUBLIC.has(name) && !S.user) return go('login');
+  const prev = $('.screen', app), dir = S.navSlide && S.navSlide[1] === name ? S.navSlide[0] : 0, fromTab = S.navFrom; S.navSlide = null;
   const view = V[name](); app.innerHTML = view.html; app._cleanup = null;
-  $$('[data-go]', app).forEach(b => b.onclick = () => go(b.dataset.go));
+  const bar = $('.screen > nav.bottom', app); if (bar) app.appendChild(bar);   // outside the screen so slides don't move it
+  S.navFrom = TABS.includes(name) ? name : null;
+  $$('[data-go]', app).forEach(b => b.onclick = () => {
+    const from = TABS.indexOf(S.navFrom), to = TABS.indexOf(b.dataset.go);
+    if (b.closest('nav.bottom') && from >= 0 && to >= 0 && from !== to) S.navSlide = [Math.sign(to - from), b.dataset.go];
+    go(b.dataset.go);
+  });
   $$('[data-back]', app).forEach(b => b.onclick = () => history.length > 1 ? history.back() : go('home'));
   $$('[data-install]', app).forEach(b => b.onclick = async () => { if (!installEvt) return; installEvt.prompt(); await installEvt.userChoice.catch(() => {}); installEvt = null; $$('[data-install]').forEach(x => { x.hidden = true; }); });
   document.body.classList.toggle('with-nav', !!$('nav.bottom', app));
+  const next = $('.screen', app), y = window.scrollY;
   bindDropdowns(app); const c = view.bind(app); app.scrollTo?.(0, 0); window.scrollTo(0, 0);
+  if (dir && prev && next?.isConnected && !matchMedia('(prefers-reduced-motion: reduce)').matches) slideScreens(app, prev, next, dir, y);
+  if (bar?.isConnected) moveNavInd(bar, fromTab);
   if (c && c.catch) c.catch(console.error);
 }
+/** Slides the old screen out and the new one in; `dir` 1 = to a tab on the right/below, -1 = to the left/above. */
+function slideScreens(app, prev, next, dir, y) {
+  prev.querySelectorAll('[id]').forEach(e => e.removeAttribute('id'));
+  prev.style.top = -y + 'px';
+  prev.classList.add('leaving', dir > 0 ? 'to-l' : 'to-r'); prev.setAttribute('aria-hidden', 'true'); prev.inert = true;
+  next.classList.add(dir > 0 ? 'from-r' : 'from-l');
+  app.classList.add('sliding'); app.appendChild(prev);
+  const done = () => { prev.remove(); next.classList.remove('from-r', 'from-l'); if (!$('.screen.leaving', app)) app.classList.remove('sliding'); };
+  prev.addEventListener('animationend', done, { once: true }); setTimeout(done, 600);
+}
+/** Glides the nav indicator from the previously active tab to the current one. */
+function moveNavInd(bar, fromTab) {
+  const ind = $('.ind', bar), cur = $('button.on', bar), from = fromTab && $(`button[data-go="${fromTab}"]`, bar);
+  if (!cur) return;
+  const place = b => { ind.style.setProperty('--x', b.offsetLeft + 'px'); ind.style.setProperty('--y', b.offsetTop + 'px');
+    ind.style.setProperty('--w', b.offsetWidth + 'px'); ind.style.setProperty('--h', b.offsetHeight + 'px'); ind.classList.toggle('at-mic', b.classList.contains('mic')); };
+  ind.style.transition = 'none'; place(from || cur); bar.classList.add('has-ind');
+  void ind.offsetWidth; ind.style.transition = ''; place(cur);
+}
 window.addEventListener('hashchange', render);
+window.addEventListener('resize', () => { const bar = $('#app > nav.bottom'); if (bar) moveNavInd(bar, null); });
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(e => console.warn('[sw]', e));
 speechSynthesis?.getVoices();
 (async () => {

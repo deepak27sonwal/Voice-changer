@@ -363,3 +363,32 @@ img, svg { max-width: 100%; }
   .tune .tgroups { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: start; }
   .tune .tgroup { margin: 0; }
 }
+
+/* tab transitions: the screens slide, the nav indicator glides */
+#app.sliding { overflow-x: clip; }
+.screen.leaving { position: absolute; left: 0; right: 0; pointer-events: none; z-index: 1; }
+.screen.leaving.to-l { animation: slide-out-l .32s cubic-bezier(.4, 0, .2, 1) forwards; }
+.screen.leaving.to-r { animation: slide-out-r .32s cubic-bezier(.4, 0, .2, 1) forwards; }
+.screen.from-r { animation: slide-in-r .32s cubic-bezier(.4, 0, .2, 1); }
+.screen.from-l { animation: slide-in-l .32s cubic-bezier(.4, 0, .2, 1); }
+@keyframes slide-in-r { from { transform: translateX(100%); } to { transform: none; } }
+@keyframes slide-in-l { from { transform: translateX(-100%); } to { transform: none; } }
+@keyframes slide-out-l { to { transform: translateX(-100%); opacity: .4; } }
+@keyframes slide-out-r { to { transform: translateX(100%); opacity: .4; } }
+nav.bottom .ind { position: absolute; top: 0; left: 0; width: 28px; height: 3px; border-radius: 0 0 3px 3px; background: var(--grad); opacity: 0;
+  transform: translateX(calc(var(--x, 0px) + var(--w, 0px) / 2 - 14px)); transition: transform .32s cubic-bezier(.4, 0, .2, 1), opacity .2s; pointer-events: none; }
+nav.bottom.has-ind .ind { opacity: 1; }
+nav.bottom.has-ind .ind.at-mic { opacity: 0; }
+nav.bottom button { transition: color .25s; }
+@media (min-width: 960px) {
+  @keyframes slide-in-r { from { transform: translateX(48px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @keyframes slide-in-l { from { transform: translateX(-48px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @keyframes slide-out-l { to { transform: translateX(-48px); opacity: 0; } }
+  @keyframes slide-out-r { to { transform: translateX(48px); opacity: 0; } }
+  nav.bottom .ind, nav.bottom.has-ind .ind.at-mic { width: var(--w); height: var(--h); border-radius: 12px; background: var(--soft); opacity: 1;
+    transform: translate(var(--x, 0px), var(--y, 0px)); }
+  nav.bottom button { position: relative; z-index: 1; }
+  nav.bottom.has-ind button.on { background: none; }
+  nav.bottom.has-ind .mic.on { background: none; }
+}
+@media (prefers-reduced-motion: reduce) { nav.bottom .ind { transition: none; } }

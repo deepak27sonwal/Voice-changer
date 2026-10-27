@@ -28,7 +28,7 @@ With it on, signed-in users get: real cloning when a voice is saved, Text to Voi
 
 ## Engagement & power features
 - **Live Voice Changer** (`#/live`): talk into the mic and hear yourself transformed in real time – Robot, Monster, Chipmunk, Alien, Radio, Telephone, Echo, Stadium, Cave, Ghost – with pitch (±12 semitones, an AudioWorklet pitch shifter), echo and reverb controls, and recording. Fully in the browser, no credits used.
-- **Effects rack**: the same effects can be applied to any generated or converted audio from the result screens (rendered offline, always from the unprocessed audio).
+- **Tune & FX**: on the Converted Audio and Generated Audio screens, start from an effect preset and fine-tune with sliders — pitch (±12 semitones), voice character (formant ±30 %), speed (0.7–1.3×, pitch kept), bass/treble (±12 dB), echo, reverb, robot, distortion and volume. Changes preview instantly, 👂 Before compares with the untuned audio, Reset restores defaults and ★ Save keeps your own presets (stored in the browser). Rendering always starts from the unprocessed audio, runs offline in the browser (no ElevenLabs credits) and Download/Share use the tuned result.
 - **Installable app (PWA)**: `manifest.webmanifest` + `sw.js` (network-first app shell, works offline); "Install app" on Home/Profile.
 - **Usage dashboard**: ElevenLabs credits left (via the `usage` route of `voice-api`), day streak, generations this week / last 90 days.
 - **Favourites & previews**: ★ and ▶ on every voice in the pickers and library; favourites and recently used voices are listed first.

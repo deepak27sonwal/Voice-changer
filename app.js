@@ -289,12 +289,17 @@ function pitchShift(buf, ratio) {
   if (Math.abs(ratio - 1) < .01) return { data: x, sr: buf.sampleRate };
   const m = Math.floor(n / ratio), y = new Float32Array(m);
   for (let i = 0; i < m; i++) { const p = i * ratio, i0 = Math.floor(p), fr = p - i0; y[i] = x[i0] * (1 - fr) + (x[i0 + 1] || 0) * fr; }
-  const G = 2048, Hs = G / 2, tol = 256, win = new Float32Array(G);
+  return { data: timeStretch(y, n), sr: buf.sampleRate };
+}
+
+/** WSOLA time-stretch: returns `y` stretched or squeezed to `n` samples without changing its pitch. */
+function timeStretch(y, n) {
+  const m = y.length, G = 2048, Hs = G / 2, tol = 256, win = new Float32Array(G);
   for (let i = 0; i < G; i++) win[i] = .5 - .5 * Math.cos(2 * Math.PI * i / G);
   const out = new Float32Array(n + G), wsum = new Float32Array(n + G);
   let last = 0;
   for (let o = 0; o < n; o += Hs) {
-    const nominal = Math.round(o / ratio);
+    const nominal = Math.round(o * m / n);
     let best = clamp(nominal, 0, Math.max(0, m - 1));
     if (o > 0) {
       const target = last + Hs; let bc = -Infinity;
@@ -309,7 +314,7 @@ function pitchShift(buf, ratio) {
   }
   const res = new Float32Array(n);
   for (let i = 0; i < n; i++) res[i] = wsum[i] > 1e-3 ? out[i] / wsum[i] : 0;
-  return { data: res, sr: buf.sampleRate };
+  return res;
 }
 
 /** Voice effects applied after pitch shifting: 'robot' (ring modulation) and 'whisper' (noise shaped by the speech envelope). */
@@ -523,13 +528,18 @@ function buildFxChain(ctx, fx, input) {
   if (fx.lowpass) filter('lowpass', fx.lowpass);
   if (fx.highpass) filter('highpass', fx.highpass);
   if (fx.band) { filter('highpass', fx.band[0]); filter('lowpass', fx.band[1]); }
+  const shelf = (type, f, db) => { const b = ctx.createBiquadFilter(); b.type = type; b.frequency.value = f; b.gain.value = db; link(b); };
+  if (fx.bass) shelf('lowshelf', 200, fx.bass);
+  if (fx.treble) shelf('highshelf', 3500, fx.treble);
   if (fx.drive) {
     const ws = ctx.createWaveShaper(), k = fx.drive * 10, n = 1024, curve = new Float32Array(n);
     for (let i = 0; i < n; i++) { const x = i * 2 / n - 1; curve[i] = (1 + k) * x / (1 + k * Math.abs(x)); }
     ws.curve = curve; link(ws);
   }
-  if (fx.ring) {   // ring modulation: signal × sine
-    const g = ctx.createGain(), osc = ctx.createOscillator(); g.gain.value = 0; osc.frequency.value = fx.ring; osc.connect(g.gain); osc.start(); link(g);
+  if (fx.ring) {   // ring modulation: signal × sine, blended with the dry signal by `ringMix` (default fully robotic)
+    const g = ctx.createGain(), osc = ctx.createOscillator(), mix = fx.ringMix ?? 1; g.gain.value = 0; osc.frequency.value = fx.ring; osc.connect(g.gain); osc.start();
+    if (mix >= 1) link(g);
+    else { const sum = ctx.createGain(), d = ctx.createGain(), w = ctx.createGain(); d.gain.value = 1 - mix; w.gain.value = mix; node.connect(d); node.connect(g); g.connect(w); d.connect(sum); w.connect(sum); node = sum; }
   }
   const out = ctx.createGain(), dry = ctx.createGain(), echo = fx.echo || 0, reverb = fx.reverb || 0;
   dry.gain.value = 1 - reverb * .35; node.connect(dry); dry.connect(out);
@@ -541,27 +551,93 @@ function buildFxChain(ctx, fx, input) {
   if (reverb > 0) { const cv = ctx.createConvolver(), wet = ctx.createGain(); cv.buffer = makeImpulse(ctx); wet.gain.value = reverb; node.connect(cv); cv.connect(wet); wet.connect(out); }
   return out;
 }
-/** Applies an effect preset to finished audio (pitch via the formant-preserving shifter, the rest via OfflineAudioContext). */
-async function renderFx(buf, fx) {
-  let data = mono(buf); const sr = buf.sampleRate;
-  if (fx.pitch) { const r = 2 ** (fx.pitch / 12); data = (psolaShift(buf, r) || pitchShift(buf, r)).data; }
-  const tail = ((fx.echo || 0) > 0 ? 1.5 : 0) + ((fx.reverb || 0) > 0 ? 2.5 : 0);
+/* Tune & FX for finished audio: presets are starting points for a set of sliders. */
+const TUNE_DEFAULTS = { base: 'none', pitch: 0, character: 0, speed: 1, bass: 0, treble: 0, echo: 0, reverb: 0, robot: 0, drive: 0, volume: 1 };
+const signed = (v, unit) => `${v > 0 ? '+' : ''}${v}${unit}`, pct = v => Math.round(v * 100) + '%';
+const TUNE_CONTROLS = [
+  ['Voice', [['pitch', 'Pitch', -12, 12, 1, v => signed(v, ' st')], ['character', 'Character', -30, 30, 1, v => signed(v, '%')], ['speed', 'Speed', .7, 1.3, .05, v => v.toFixed(2) + '×']]],
+  ['Tone', [['bass', 'Bass', -12, 12, 1, v => signed(v, ' dB')], ['treble', 'Treble', -12, 12, 1, v => signed(v, ' dB')]]],
+  ['Effects', [['echo', 'Echo', 0, .8, .05, pct], ['reverb', 'Reverb', 0, 1, .05, pct], ['robot', 'Robot', 0, 1, .05, pct], ['drive', 'Distortion', 0, 1, .05, pct]]],
+  ['Output', [['volume', 'Volume', 0, 1.5, .05, pct]]],
+];
+const TUNE_LABEL = Object.fromEntries(TUNE_CONTROLS.flatMap(([, c]) => c.map(x => [x[0], x[5]])));
+const presetTune = p => ({ ...TUNE_DEFAULTS, base: p.id, pitch: p.pitch || 0, echo: p.echo || 0, reverb: p.reverb || 0, robot: p.ring ? 1 : 0, drive: p.drive ? Math.min(1, p.drive / 4) : 0 });
+const userPresets = () => ls.get('fxpresets', []);
+const isNeutral = t => Object.keys(TUNE_DEFAULTS).every(k => k === 'base' || t[k] === TUNE_DEFAULTS[k]) && fxPreset(t.base).id === 'none';
+/** Builds the effect-chain settings for a tune: the base preset's filter shape plus the slider amounts. */
+const tuneToFx = t => { const b = fxPreset(t.base); return { lowpass: b.lowpass, highpass: b.highpass, band: b.band, bass: t.bass, treble: t.treble,
+  ring: t.robot > 0 ? (b.ring || 50) : 0, ringMix: t.robot, drive: t.drive * 4, echo: t.echo, reverb: t.reverb }; };
+/**
+ * Renders a tune onto finished audio: speed (time-stretch, pitch kept), pitch + voice character (formant-preserving
+ * shifter), then tone/effects through the offline effect chain, then volume with soft limiting.
+ */
+async function renderTune(buf, t) {
+  const sr = buf.sampleRate; let data = mono(buf);
+  if (Math.abs(t.speed - 1) > .01) data = timeStretch(data, Math.round(data.length / t.speed));
+  if (t.pitch || t.character) {
+    const tmp = ac().createBuffer(1, data.length, sr); tmp.copyToChannel(data, 0);
+    const r = 2 ** (t.pitch / 12), shifted = psolaShift(tmp, r, r ** .3 * (1 + t.character / 100));
+    data = shifted ? shifted.data : t.pitch ? pitchShift(tmp, r).data : data;
+  }
+  const fx = tuneToFx(t), tail = (fx.echo > 0 ? 1.5 : 0) + (fx.reverb > 0 ? 2.5 : 0);
   const octx = new OfflineAudioContext(1, data.length + Math.ceil(tail * sr), sr), src = octx.createBufferSource(), inBuf = octx.createBuffer(1, data.length, sr);
   inBuf.copyToChannel(data, 0); src.buffer = inBuf; buildFxChain(octx, fx, src).connect(octx.destination); src.start();
   const out = await octx.startRendering(), d = out.getChannelData(0); let peak = 0;
   for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i]));
-  if (peak > .95) for (let i = 0; i < d.length; i++) d[i] *= .95 / peak;
+  const gain = (peak > .95 ? .95 / peak : 1) * t.volume;
+  for (let i = 0; i < d.length; i++) d[i] = t.volume > 1 ? Math.tanh(d[i] * gain) : d[i] * gain;   // soft-limit boosts
   return out;
 }
-/** "Effects" chip row for result screens. `onPick(preset)` re-renders the audio. */
-const fxRowHtml = sel => `<div class="fxrow" role="group" aria-label="Effects"><span class="muted">Effects</span>${FX_PRESETS.map(p => `<button type="button" class="fxchip ${p.id === sel ? 'on' : ''}" data-fx="${p.id}">${p.emoji} ${p.name}</button>`).join('')}</div>`;
-function bindFxRow(r, onPick) {
-  $$('[data-fx]', r).forEach(b => b.onclick = async () => {
-    if (b.classList.contains('on') || b.disabled) return;
-    $$('[data-fx]', r).forEach(x => { x.disabled = true; x.classList.toggle('on', x === b); });
-    try { await onPick(fxPreset(b.dataset.fx)); } catch (e) { console.error(e); toast('Couldn’t apply that effect'); }
-    $$('[data-fx]', r).forEach(x => { x.disabled = false; });
-  });
+const tuneChips = sel => [...FX_PRESETS.map(p => ({ id: p.id, label: `${p.emoji} ${p.name}` })), ...userPresets().map(p => ({ id: p.id, label: `⭐ ${p.name}`, user: true }))]
+  .map(c => `<button type="button" class="fxchip ${c.id === sel ? 'on' : ''}" data-tp="${esc(c.id)}">${esc(c.label)}${c.user ? `<span class="tp-del" data-tpdel="${esc(c.id)}" role="button" aria-label="Delete preset">✕</span>` : ''}</button>`).join('');
+const tuneHtml = t => `<div class="panel tune"><div class="panel-head"><strong>🎛️ Tune &amp; FX</strong><span class="muted tune-status" aria-live="polite"></span></div>
+  <div class="fxrow" role="group" aria-label="Presets">${tuneChips(t.preset || t.base)}</div>
+  <div class="tgroups">${TUNE_CONTROLS.map(([g, ctrls], gi) => `<details class="vs tgroup" ${gi === 0 || gi === 2 || matchMedia('(min-width: 960px)').matches ? 'open' : ''}><summary>${g}</summary>${ctrls.map(([k, label, min, max, step, show]) =>
+    `<div class="slider"><span>${label}</span><input type="range" data-tk="${k}" min="${min}" max="${max}" step="${step}" value="${t[k]}" aria-label="${label}"><b data-tkv="${k}">${show(t[k])}</b></div>`).join('')}</details>`).join('')}</div>
+  <div class="tune-actions"><button type="button" class="hact" data-tab>👂 Before</button><button type="button" class="hact" data-treset>↺ Reset</button><button type="button" class="hact" data-tsave>★ Save preset</button></div></div>`;
+/**
+ * Wires a Tune & FX panel. `s` = { tune, dry: { buf, blob }, apply(buf, blob) → shows the tuned result, stop() → stops playback }.
+ * Every render starts from the unprocessed audio, ~350 ms after the last change.
+ */
+function bindTune(r, s) {
+  const t = s.tune, status = $('.tune-status', r);
+  let timer = 0, token = 0, before = null;
+  const sync = () => $$('[data-tk]', r).forEach(i => { i.value = t[i.dataset.tk]; $(`[data-tkv="${i.dataset.tk}"]`, r).textContent = TUNE_LABEL[i.dataset.tk](t[i.dataset.tk]); });
+  const markChip = id => { t.preset = id; $$('[data-tp]', r).forEach(c => c.classList.toggle('on', c.dataset.tp === id)); };
+  const run = async () => {
+    const my = ++token; status.textContent = 'Applying…'; await sleep(20);
+    try {
+      const neutral = isNeutral(t), out = neutral ? s.dry.buf : await renderTune(s.dry.buf, t);
+      if (my !== token || !r.isConnected) return;
+      s.apply(out, neutral ? s.dry.blob : encodeWav(mono(out), out.sampleRate)); status.textContent = neutral ? '' : 'Tuned';
+    } catch (e) { console.error(e); if (my === token) { status.textContent = ''; toast('Couldn’t apply that tuning'); } }
+  };
+  const schedule = (ms = 350) => { clearTimeout(timer); status.textContent = '…'; timer = setTimeout(run, ms); };
+  const bindChips = () => {
+    $$('[data-tp]', r).forEach(c => c.onclick = e => {
+      if (e.target.closest('[data-tpdel]')) {
+        const id = e.target.closest('[data-tpdel]').dataset.tpdel; if (!confirm('Delete this preset?')) return;
+        ls.set('fxpresets', userPresets().filter(p => p.id !== id)); $('.tune .fxrow', r).innerHTML = tuneChips(t.preset); return bindChips();
+      }
+      const user = userPresets().find(p => p.id === c.dataset.tp);
+      Object.assign(t, user ? { ...TUNE_DEFAULTS, ...user.tune } : presetTune(fxPreset(c.dataset.tp))); markChip(c.dataset.tp); sync(); schedule(0);
+    });
+  };
+  bindChips();
+  $$('[data-tk]', r).forEach(i => i.oninput = () => { t[i.dataset.tk] = +i.value; $(`[data-tkv="${i.dataset.tk}"]`, r).textContent = TUNE_LABEL[i.dataset.tk](t[i.dataset.tk]); markChip(''); schedule(); });
+  $('[data-treset]', r).onclick = () => { Object.assign(t, TUNE_DEFAULTS); markChip('none'); sync(); schedule(0); };
+  $('[data-tsave]', r).onclick = () => {
+    const name = (prompt('Name this preset', 'My voice') || '').trim().slice(0, 24); if (!name) return;
+    const p = { id: 'u-' + uid(), name, tune: Object.fromEntries(Object.keys(TUNE_DEFAULTS).map(k => [k, t[k]])) };
+    ls.set('fxpresets', [...userPresets(), p]); $('.tune .fxrow', r).innerHTML = tuneChips(p.id); t.preset = p.id; bindChips(); toast(`⭐ Saved “${name}”`);
+  };
+  const ab = $('[data-tab]', r);
+  ab.onclick = () => {
+    if (before) { before(); return; }
+    s.stop(); const stop = bufferSource(s.dry.buf).play(() => { before = null; ab.textContent = '👂 Before'; ab.classList.remove('on'); });
+    before = () => { stop(); before = null; ab.textContent = '👂 Before'; ab.classList.remove('on'); }; ab.textContent = '■ Stop'; ab.classList.add('on');
+  };
+  return () => { clearTimeout(timer); token++; if (before) before(); };
 }
 /* Real-time pitch shifter: two crossfaded taps sweeping through a short delay line (runs in the audio thread). */
 const PITCH_WORKLET = `class PitchShifter extends AudioWorkletProcessor {
@@ -1030,19 +1106,17 @@ V['tts-result'] = () => {
     if (gone()) return;
     const src = device ? speakSource(res.text, v, S.vs.stability, S.vs.similarity, S.tts.sysVoice, S.vs) : bufferSource(buf), dry = { buf, blob };
     body.innerHTML = `<div class="player">${playerHtml(device ? fakePeaks(res.text.length) : peaks(buf), src.duration, true)}</div>
-      ${device ? '' : fxRowHtml('none')}
+      ${device ? '' : tuneHtml(res.tune || (res.tune = { ...TUNE_DEFAULTS }))}
       <p class="muted center" style="margin-bottom:14px">“${esc(res.text.slice(0, 90))}${res.text.length > 90 ? '…' : ''}” — ${esc(v.name)}${standIn && buf ? ` (ElevenLabs ${esc(standIn.name.split(' - ')[0])})` : ''}${device ? ' (device voice)' : ''}</p>
       <div class="actions"><button class="act" id="dl" ${device ? 'disabled' : ''}>${icon('download')}Download</button>
         <button class="act" id="sh">${icon('share')}Share</button><button class="act del" id="rm">${icon('trash')}Delete</button></div>
       <button class="btn" id="again">Generate Again</button>`;
     let p = bindPlayer($('.player', r), async () => device ? src : bufferSource(buf));
-    if (!device) bindFxRow(r, async fx => {
-      p(); if (fx.id === 'none') ({ buf, blob } = dry); else { buf = await renderFx(dry.buf, fx); blob = encodeWav(mono(buf), buf.sampleRate); }
-      const pl = $('.player', r); pl.innerHTML = playerHtml(peaks(buf), buf.duration, true); p = bindPlayer(pl, async () => bufferSource(buf)); $('.play', pl).click();
-    });
+    if (!device) r._cleanup = bindTune(r, { tune: res.tune, dry, stop: () => p(),
+      apply: (b2, bl2) => { p(); buf = b2; blob = bl2; const pl = $('.player', r); pl.innerHTML = playerHtml(peaks(buf), buf.duration, true); p = bindPlayer(pl, async () => bufferSource(buf)); $('.play', pl).click(); } });
     if (res.fresh) { res.fresh = false; const item = { id: res.id, kind: 'tts', title: res.text.slice(0, 32), text: res.text, voiceId: res.voiceId, ts: Date.now(), dur: src.duration }; S.recents.unshift(item); saveRecents(); cloud.upsertRecent(item); if (blob) blobs.put('audio:' + res.id, blob); }
     setTimeout(() => $('.play', r)?.click(), 250);
-    $('#again', r).onclick = () => { if (device) { p(); $('.play', r).click(); } else { res.buf = res.blob = null; res.fresh = false; render(); } };
+    $('#again', r).onclick = () => { if (device) { p(); $('.play', r).click(); } else { res.buf = res.blob = null; res.fresh = false; res.tune = null; render(); } };
     $('#sh', r).onclick = async () => { if (blob && navigator.canShare?.({ files: [new File([blob], blob.type.includes('mpeg') ? 'jolovocals.mp3' : 'jolovocals.wav', { type: blob.type || 'audio/wav' })] })) return navigator.share({ files: [new File([blob], blob.type.includes('mpeg') ? 'jolovocals.mp3' : 'jolovocals.wav', { type: blob.type || 'audio/wav' })] }).catch(() => {});
       navigator.share ? navigator.share({ title: 'JoloVocals', text: res.text }).catch(() => {}) : navigator.clipboard?.writeText(res.text).then(() => toast('Text copied')); };
     $('#rm', r).onclick = () => { S.recents = S.recents.filter(a => a.id !== res.id); saveRecents(); cloud.deleteRecent(res.id); blobs.del('audio:' + res.id); S.ttsResult = null; go('tts'); };
@@ -1108,7 +1182,7 @@ V['v2v-result'] = () => {
   return { html: `<section class="screen">${top('Converted Audio')}
     <div class="seg"><button data-w="original" ${res.original ? '' : 'disabled'}>Original</button><button data-w="converted" class="on">Converted</button></div>
     <div class="player" id="pl"></div>
-    ${fxRowHtml(res.fx || 'none')}
+    ${tuneHtml(res.tune || (res.tune = { ...TUNE_DEFAULTS }))}
     <div class="actions"><button class="act" id="dl">${icon('download')}Download</button><button class="act" id="sh">${icon('share')}Share</button><button class="act del" id="rm">${icon('trash')}Delete</button></div>
     <div class="grow"></div><button class="btn" id="more">${icon('wave')} Convert Another</button></section>`,
   bind: r => {
@@ -1116,13 +1190,9 @@ V['v2v-result'] = () => {
     const draw = () => { const buf = res[which]; $('#pl', r).innerHTML = playerHtml(peaks(buf), buf.duration, true); halt = bindPlayer($('#pl', r), async () => bufferSource(res[which])); };
     draw();
     $$('.seg button', r).forEach(b => b.onclick = () => { if (b.disabled) return; halt(); which = b.dataset.w; $$('.seg button', r).forEach(x => x.classList.toggle('on', x === b)); draw(); });
-    res.dry = res.dry || { buf: res.converted, blob: res.blob };   // effects always start from the unprocessed result
-    bindFxRow(r, async p => {
-      halt(); res.fx = p.id;
-      if (p.id === 'none') { res.converted = res.dry.buf; res.blob = res.dry.blob; }
-      else { const out = await renderFx(res.dry.buf, p); res.converted = out; res.blob = encodeWav(mono(out), out.sampleRate); }
-      which = 'converted'; $$('.seg button', r).forEach(x => x.classList.toggle('on', x.dataset.w === 'converted')); draw(); $('.play', r).click();
-    });
+    res.dry = res.dry || { buf: res.converted, blob: res.blob };   // tuning always starts from the unprocessed result
+    r._cleanup = bindTune(r, { tune: res.tune, dry: res.dry, stop: () => halt(),
+      apply: (buf, blob) => { halt(); res.converted = buf; res.blob = blob; which = 'converted'; $$('.seg button', r).forEach(x => x.classList.toggle('on', x.dataset.w === 'converted')); draw(); $('#pl .play', r).click(); } });
     $('#dl', r).onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(res.blob); a.download = `jolovocals-${res.id}.${res.blob.type.includes('mpeg') ? 'mp3' : 'wav'}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
     $('#sh', r).onclick = async () => { const f = new File([res.blob], 'jolovocals.wav', { type: 'audio/wav' });
       if (navigator.canShare?.({ files: [f] })) navigator.share({ files: [f] }).catch(() => {}); else toast('Sharing files isn’t supported here – use Download'); };

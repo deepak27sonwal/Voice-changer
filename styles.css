@@ -345,3 +345,21 @@ img, svg { max-width: 100%; }
   .row:hover, .tpl:hover, .mcard:hover { box-shadow: 0 6px 20px rgba(80, 60, 160, .1); }
 }
 @media (min-width: 1280px) { .screen { max-width: 1120px; } }
+
+/* ── tune & fx panel ── */
+.tune { margin: 6px 0 14px; }
+.tune .fxrow { padding-top: 0; }
+.tune .tgroup { margin: 8px 0 0; background: #faf9ff; }
+.tune .tgroup summary { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+.tune .slider { grid-template-columns: 84px 1fr 62px; }
+.tune-status { font-size: 12px; min-width: 50px; text-align: right; }
+.tune-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.tune-actions .hact { padding: 8px 12px; font-size: 13px; }
+.hact.on { background: var(--grad); color: #fff; border-color: transparent; }
+.fxchip { position: relative; }
+.tp-del { margin-left: 6px; font-size: 11px; opacity: .6; padding: 0 2px; }
+.tp-del:hover { opacity: 1; }
+@media (min-width: 960px) {
+  .tune .tgroups { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: start; }
+  .tune .tgroup { margin: 0; }
+}

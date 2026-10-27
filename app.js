@@ -639,19 +639,43 @@ function bindTune(r, s) {
   };
   return () => { clearTimeout(timer); token++; if (before) before(); };
 }
-/* Real-time pitch shifter: two crossfaded taps sweeping through a short delay line (runs in the audio thread). */
+/*
+ * Real-time voice processor (runs in the audio thread):
+ *  1. noise gate – adaptive noise floor, 300 ms hold and slow release so word endings ring out, background hiss is pushed down ~24 dB between phrases;
+ *  2. pitch shifter – two crossfaded taps sweeping through a short delay line; fully bypassed at 0 st, where the two taps
+ *     would otherwise double the voice and sound like a small, hollow room.
+ */
 const PITCH_WORKLET = `class PitchShifter extends AudioWorkletProcessor {
-  static get parameterDescriptors() { return [{ name: 'ratio', defaultValue: 1, minValue: 0.25, maxValue: 4 }]; }
-  constructor() { super(); this.N = 2048; this.buf = new Float32Array(this.N); this.w = 0; this.ph = 0; }
+  static get parameterDescriptors() { return [{ name: 'ratio', defaultValue: 1, minValue: 0.25, maxValue: 4 }, { name: 'gate', defaultValue: 1, minValue: 0, maxValue: 1 }]; }
+  constructor() {
+    super(); this.N = 2048; this.buf = new Float32Array(this.N); this.w = 0; this.ph = 0; this.mix = 0;
+    const ms = t => Math.exp(-1 / (sampleRate * t / 1000));
+    this.envA = 1 - ms(10); this.atk = 1 - ms(3); this.rel = 1 - ms(180); this.floorUp = 1 - ms(4000); this.floorDown = 1 - ms(50);
+    this.env = 0; this.floor = 0.002; this.g = 1; this.hold = 0; this.holdN = Math.round(sampleRate * 0.3);
+  }
   read(pos) { const N = this.N, p = ((pos % N) + N) % N, i = Math.floor(p), f = p - i; return this.buf[i] * (1 - f) + this.buf[(i + 1) % N] * f; }
   process(inputs, outputs, params) {
     const inp = inputs[0] && inputs[0][0], out = outputs[0][0]; if (!out) return true;
-    const ratio = params.ratio[0], N = this.N;
+    const ratio = params.ratio[0], gateOn = params.gate[0] > 0.5, N = this.N, shiftTo = Math.abs(ratio - 1) > 0.005 ? 1 : 0;
     for (let i = 0; i < out.length; i++) {
-      this.buf[this.w] = inp ? inp[i] : 0;
-      this.ph = (this.ph + (1 - ratio) / N + 1) % 1;
-      const p2 = (this.ph + 0.5) % 1, g1 = 0.5 - 0.5 * Math.cos(2 * Math.PI * this.ph), g2 = 0.5 - 0.5 * Math.cos(2 * Math.PI * p2);
-      out[i] = this.read(this.w - this.ph * N) * g1 + this.read(this.w - p2 * N) * g2;
+      let x = inp ? inp[i] : 0;
+      // gate: RMS envelope vs. an adaptive noise floor (falls fast, rises slowly so speech doesn't raise it)
+      this.env += (x * x - this.env) * this.envA; const lvl = Math.sqrt(this.env);
+      this.floor += (lvl - this.floor) * (lvl < this.floor ? this.floorDown : this.floorUp);
+      const thr = Math.max(0.006, this.floor * 3);
+      if (lvl > thr) this.hold = this.holdN; else if (this.hold > 0) this.hold--;
+      const target = !gateOn || this.hold > 0 ? 1 : 0.06;
+      this.g += (target - this.g) * (target > this.g ? this.atk : this.rel); x *= this.g;
+      // pitch shift, crossfaded in/out so moving to or from 0 st doesn't click
+      this.buf[this.w] = x;
+      this.mix += (shiftTo - this.mix) * 0.0005;
+      let y = x;
+      if (this.mix > 0.0005) {
+        this.ph = (this.ph + (1 - ratio) / N + 1) % 1;
+        const p2 = (this.ph + 0.5) % 1, g1 = 0.5 - 0.5 * Math.cos(2 * Math.PI * this.ph), g2 = 0.5 - 0.5 * Math.cos(2 * Math.PI * p2);
+        y = x * (1 - this.mix) + (this.read(this.w - this.ph * N) * g1 + this.read(this.w - p2 * N) * g2) * this.mix;
+      }
+      out[i] = y;
       this.w = (this.w + 1) % N;
     }
     for (let c = 1; c < outputs[0].length; c++) outputs[0][c].set(out);
@@ -1232,7 +1256,7 @@ V.live = () => {
       <div class="slider"><span>Echo</span><input type="range" id="lv-echo" min="0" max="0.8" step="0.05" value="${L.echo}" aria-label="Echo"><b id="lv-echo-v">${Math.round(L.echo * 100)}%</b></div>
       <div class="slider"><span>Reverb</span><input type="range" id="lv-reverb" min="0" max="1" step="0.05" value="${L.reverb}" aria-label="Reverb"><b id="lv-reverb-v">${Math.round(L.reverb * 100)}%</b></div>
       <label class="check" style="margin:8px 0"><input type="checkbox" id="lv-monitor" ${L.monitor ? 'checked' : ''}><span>Hear myself <span class="muted">– turn off to record silently</span></span></label>
-      <label class="check" style="margin:8px 0"><input type="checkbox" id="lv-denoise" ${L.denoise ? 'checked' : ''}><span>Reduce background noise <span class="muted">– may clip quiet word endings</span></span></label>
+      <label class="check" style="margin:8px 0"><input type="checkbox" id="lv-denoise" ${L.denoise !== false ? 'checked' : ''}><span>Reduce background noise <span class="muted">– quiets hiss between words</span></span></label>
     </details>
     <div class="grow"></div><button class="btn" id="live-rec" disabled>${icon('mic')} Record</button>${nav('live')}</section>`,
   bind: r => {
@@ -1240,8 +1264,10 @@ V.live = () => {
     const status = t => { $('#live-status', r).textContent = t; };
     const fx = () => ({ ...fxPreset(L.preset), echo: L.echo, reverb: L.reverb });
     const save = () => ls.set('live', L);
-    // Raw mic by default: the browser's noise suppression gates quiet word endings and echo cancellation ducks the voice.
-    const micConstraints = () => ({ echoCancellation: false, noiseSuppression: !!L.denoise, autoGainControl: false });
+    // Echo cancellation stops the speaker output from feeding back into the mic (heard as a creepy, ringing reverb).
+    // The browser's noise suppression stays off – it clips word endings; our gentle gate in the worklet handles hiss instead.
+    const micConstraints = () => ({ echoCancellation: true, noiseSuppression: false, autoGainControl: false });
+    const gateOn = () => (L.denoise !== false ? 1 : 0);
     /** How long sound keeps coming out of the chain after the voice stops: pitch delay line + echo repeats + reverb tail. */
     const tailMs = () => {
       const echo = L.echo || 0, fb = Math.min(.75, echo * .9);
@@ -1274,10 +1300,11 @@ V.live = () => {
       try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() }); }
       catch { return toast('Microphone unavailable – allow access to use the live voice changer'); }
       ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
-      src = ctx.createMediaStreamSource(stream);
+      src = ctx.createBiquadFilter(); src.type = 'highpass'; src.frequency.value = 80;   // drop mic rumble / handling noise
+      ctx.createMediaStreamSource(stream).connect(src);
       try {
         await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([PITCH_WORKLET], { type: 'application/javascript' })));
-        shifter = new AudioWorkletNode(ctx, 'pitch-shifter'); src.connect(shifter);
+        shifter = new AudioWorkletNode(ctx, 'pitch-shifter'); shifter.parameters.get('gate').value = gateOn(); src.connect(shifter);
       } catch (e) { console.warn('[live] pitch shifting unavailable', e); shifter = null; toast('Pitch shifting isn’t supported in this browser – other effects still work'); }
       outGain = ctx.createGain(); analyser = ctx.createAnalyser(); analyser.fftSize = 1024; recDest = ctx.createMediaStreamDestination();
       outGain.connect(analyser); outGain.connect(recDest); if (L.monitor) outGain.connect(ctx.destination);
@@ -1302,15 +1329,7 @@ V.live = () => {
     });
     [['pitch', v => `${v > 0 ? '+' : ''}${v} st`], ['echo', v => Math.round(v * 100) + '%'], ['reverb', v => Math.round(v * 100) + '%']].forEach(([k, show]) =>
       $('#lv-' + k, r).oninput = e => { L[k] = +e.target.value; $(`#lv-${k}-v`, r).textContent = show(L[k]); save(); if (k === 'pitch') { if (shifter) shifter.parameters.get('ratio').value = 2 ** (L.pitch / 12); } else rewire(); });
-    $('#lv-denoise', r).onchange = async e => {
-      L.denoise = e.target.checked; save();
-      const track = stream?.getAudioTracks()[0]; if (!track) return;
-      try { await track.applyConstraints(micConstraints()); }
-      catch {   // some browsers can't change processing on a live track – reopen the mic
-        if (rec && rec.state === 'recording') return toast('Takes effect after this recording');
-        stop(); start();
-      }
-    };
+    $('#lv-denoise', r).onchange = e => { L.denoise = e.target.checked; save(); if (shifter) shifter.parameters.get('gate').value = gateOn(); };
     $('#lv-monitor', r).onchange = e => { L.monitor = e.target.checked; save(); if (outGain) { try { outGain.disconnect(ctx.destination); } catch { /* wasn't connected */ } if (L.monitor) outGain.connect(ctx.destination); } };
     $('#live-rec', r).onclick = () => {
       const btn = $('#live-rec', r);

@@ -713,7 +713,7 @@ const ddHtml = (id, groups, sel) => {
       const text = `<span>${esc(o.label)}</span>${o.sub ? `<small>${esc(o.sub)}</small>` : ''}`;
       return o.acts
         ? `<li role="option" tabindex="-1" class="has-acts" data-v="${esc(o.value)}" aria-selected="${o.value === cur.value}"><span class="dd-text">${text}</span><span class="dd-acts">
-            <button type="button" class="dd-act" data-prev="${esc(o.value)}" tabindex="-1" aria-label="Preview ${esc(o.label)}">▶</button>
+            <button type="button" class="dd-act" data-prev="${esc(o.value)}" tabindex="-1" aria-label="Preview ${esc(o.label)}">${PREV_PLAY}</button>
             <button type="button" class="dd-act star" data-fav="${esc(o.value)}" tabindex="-1" aria-pressed="${!!o.fav}" aria-label="Favourite ${esc(o.label)}">★</button></span></li>`
         : `<li role="option" tabindex="-1" data-v="${esc(o.value)}" aria-selected="${o.value === cur.value}">${text}</li>`;
     }).join('')).join('')}</ul></div>`;
@@ -757,10 +757,13 @@ async function previewVoice(v, btn) {
   if (sample) src = bufferSource(await decode(sample));
   else if (v.preview) src = urlSource(v.preview);
   else { const si = cloud.hosted && !v.remote ? elVoiceFor(isMale(v), v.cat === 'Hindi') : null; src = si?.preview ? urlSource(si.preview) : speakSource(`Hello, this is ${v.name}.`, v, .8, 1); }
-  const label = btn.innerHTML; btn.classList.add('playing'); btn.innerHTML = '■';
+  const label = btn.innerHTML; btn.classList.add('playing'); btn.innerHTML = PREV_STOP;
   const reset = () => { btn.classList.remove('playing'); btn.innerHTML = label; S.stopPlayback = null; };
   const stop = src.play(reset); S.stopPlayback = () => { stop(); reset(); };
 }
+// Preview button glyphs; the triangle sits slightly right of centre so it looks centred.
+const PREV_PLAY = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13L18.5 12z"/></svg>';
+const PREV_STOP = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/></svg>';
 /** Replays a one-shot CSS animation class on `el`. */
 const flash = (el, cls) => { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); setTimeout(() => el.classList.remove(cls), 500); };
 // Star / preview buttons anywhere (dropdowns, library); capture phase so they never select the dropdown option.

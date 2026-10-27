@@ -277,8 +277,6 @@ input[type=range] { width: 100%; accent-color: var(--p); }
 .dd-list li.has-acts { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; }
 .dd-text { display: flex; flex-direction: column; min-width: 0; }
 .dd-acts { display: flex; gap: 4px; }
-.dd-act { width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--line); background: #fff; color: var(--p); font-size: 12px; cursor: pointer; display: grid; place-items: center; }
-.dd-list li[aria-selected=true] .dd-act { background: rgba(255, 255, 255, .9); }
 .star { color: #c4c0d8; font-size: 18px; }
 .star[aria-pressed=true] { color: #f59e0b; }
 .dd-act.star { font-size: 15px; }
@@ -392,3 +390,42 @@ nav.bottom button { transition: color .25s; }
   nav.bottom.has-ind .mic.on { background: none; }
 }
 @media (prefers-reduced-motion: reduce) { nav.bottom .ind { transition: none; } }
+
+/* dropdown: hover / press / open effects */
+.dd-btn { transition: border-color .2s, box-shadow .2s, background .2s, transform .12s; }
+.dd-btn:active { transform: scale(.99); }
+.dd-btn[aria-expanded=true] .dd-caret { color: var(--p); }
+.dd-btn[aria-expanded=true] { border-color: var(--p); box-shadow: 0 0 0 3px rgba(124, 58, 237, .15); }
+.dd-btn.picked { animation: dd-picked .45s ease; }
+@keyframes dd-picked { 0% { box-shadow: 0 0 0 0 rgba(124, 58, 237, .45); background: var(--soft); } 100% { box-shadow: 0 0 0 10px rgba(124, 58, 237, 0); } }
+.dd-list:not([hidden]) { animation: dd-open .18s cubic-bezier(.2, .8, .3, 1); transform-origin: top center; }
+@keyframes dd-open { from { opacity: 0; transform: translateY(-6px) scale(.98); } }
+.dd-list li[role=option] { position: relative; transition: background .15s, transform .12s, box-shadow .15s; }
+.dd-list li[role=option]:not([aria-selected=true]):focus-visible { background: var(--soft); box-shadow: inset 3px 0 0 var(--p); }
+.dd-list li[role=option]:active { transform: scale(.98); background: #e6defd; }
+/* preview (play) and favourite buttons */
+.dd-act { width: 32px; height: 32px; border-radius: 50%; border: 0; font-size: 12px; cursor: pointer; display: grid; place-items: center;
+  transition: transform .15s, box-shadow .2s, background .2s, color .2s; }
+.dd-act[data-prev] { background: var(--grad); color: #fff; box-shadow: 0 3px 10px rgba(124, 58, 237, .35); padding-left: 2px; }
+.dd-act[data-prev].playing { background: linear-gradient(90deg, #ef4444, #f97316); padding-left: 0; animation: dd-playing 1.2s ease-in-out infinite; }
+@keyframes dd-playing { 50% { box-shadow: 0 0 0 6px rgba(239, 68, 68, .18); } }
+.dd-act.star { background: #f1eefe; color: #b9b3d6; font-size: 15px; }
+.dd-act.star[aria-pressed=true] { background: linear-gradient(135deg, #fcd34d, #f59e0b); color: #fff; box-shadow: 0 3px 10px rgba(245, 158, 11, .4); }
+.dd-act:active { transform: scale(.88); }
+.dd-act:focus-visible { outline: 2px solid var(--p); outline-offset: 2px; }
+.dd-list li[aria-selected=true] .dd-act[data-prev]:not(.playing) { background: #fff; color: var(--p); }
+.dd-list li[aria-selected=true] .dd-act.star:not([aria-pressed=true]) { background: rgba(255, 255, 255, .22); color: #fff; }
+.star.pop { animation: star-pop .4s cubic-bezier(.3, 1.6, .5, 1); }
+@keyframes star-pop { 0% { transform: scale(.7); } 60% { transform: scale(1.3); } 100% { transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { .dd-list:not([hidden]), .dd-btn.picked, .star.pop, .dd-act[data-prev].playing { animation: none; } }
+@media (hover: hover) {
+  .dd-btn:hover { border-color: #c9bdf7; box-shadow: 0 4px 14px rgba(124, 58, 237, .1); }
+  .dd-btn:hover .dd-caret { color: var(--p); }
+  .dd-list li[role=option]:not([aria-selected=true]):hover { background: var(--soft); transform: translateX(3px); box-shadow: inset 3px 0 0 var(--p); }
+  .dd-list li[aria-selected=true]:hover { filter: brightness(1.06); }
+  .dd-act:hover { transform: scale(1.1); }
+  .dd-act[data-prev]:hover { box-shadow: 0 5px 14px rgba(124, 58, 237, .5); }
+  .dd-act.star:not([aria-pressed=true]):hover { background: #fff4d6; color: #f59e0b; }
+  .dd-act:active { transform: scale(.88); }
+  .dd-list li[role=option]:not([aria-selected=true]):active { transform: scale(.98); background: #e6defd; }
+}

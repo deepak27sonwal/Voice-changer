@@ -726,7 +726,7 @@ function bindDropdowns(root) {
     const open = () => { $$('.dd-list').forEach(l => { l.hidden = true; }); list.hidden = false; btn.setAttribute('aria-expanded', 'true');
       const s = $('[aria-selected=true]', dd); s?.scrollIntoView({ block: 'nearest' }); s?.focus(); };
     const pick = o => { dd.dataset.value = o.dataset.v; opts.forEach(x => x.setAttribute('aria-selected', x.dataset.v === o.dataset.v));
-      $('.dd-label', dd).innerHTML = ($('.dd-text', o) || o).innerHTML; close(); btn.focus(); dd.dispatchEvent(new Event('change')); };
+      $('.dd-label', dd).innerHTML = ($('.dd-text', o) || o).innerHTML; close(); btn.focus(); flash(btn, 'picked'); dd.dispatchEvent(new Event('change')); };
     btn.onclick = () => list.hidden ? open() : close();
     opts.forEach(o => { o.onclick = e => { if (!e.target.closest('.dd-act')) pick(o); };
       o.onkeydown = e => { const i = opts.indexOf(o);
@@ -761,10 +761,12 @@ async function previewVoice(v, btn) {
   const reset = () => { btn.classList.remove('playing'); btn.innerHTML = label; S.stopPlayback = null; };
   const stop = src.play(reset); S.stopPlayback = () => { stop(); reset(); };
 }
+/** Replays a one-shot CSS animation class on `el`. */
+const flash = (el, cls) => { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); setTimeout(() => el.classList.remove(cls), 500); };
 // Star / preview buttons anywhere (dropdowns, library); capture phase so they never select the dropdown option.
 document.addEventListener('click', e => {
   const fav = e.target.closest('[data-fav]'), prev = e.target.closest('[data-prev]');
-  if (fav) { e.stopPropagation(); const on = toggleFav(fav.dataset.fav); $$('[data-fav]').forEach(b => { if (b.dataset.fav === fav.dataset.fav) b.setAttribute('aria-pressed', on); }); toast(on ? '★ Added to favourites' : 'Removed from favourites'); }
+  if (fav) { e.stopPropagation(); const on = toggleFav(fav.dataset.fav); $$('[data-fav]').forEach(b => { if (b.dataset.fav === fav.dataset.fav) b.setAttribute('aria-pressed', on); }); flash(fav, 'pop'); toast(on ? '★ Added to favourites' : 'Removed from favourites'); }
   else if (prev) { e.stopPropagation(); previewVoice(findVoice(prev.dataset.prev), prev); }
 }, true);
 const voiceDropdown = (id, sel) => {

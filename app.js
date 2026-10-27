@@ -1208,6 +1208,17 @@ V['v2v-result'] = () => {
 };
 
 /* Live voice changer: mic → pitch worklet → effect chain → speakers (+ recorder). */
+/** Cuts trailing silence (below about −50 dBFS) to `keep` seconds after the last sound. */
+function trimTail(buf, keep) {
+  const sr = buf.sampleRate, chs = Array.from({ length: buf.numberOfChannels }, (_, c) => buf.getChannelData(c));
+  let last = 0;
+  for (let i = buf.length - 1; i >= 0 && !last; i--) for (const d of chs) if (Math.abs(d[i]) > .003) { last = i; break; }
+  const n = Math.min(buf.length, last + Math.round(keep * sr));
+  if (!last || n >= buf.length - sr * .05) return buf;
+  const out = new AudioBuffer({ length: n, numberOfChannels: chs.length, sampleRate: sr });
+  chs.forEach((d, c) => out.copyToChannel(d.subarray(0, n), c));
+  return out;
+}
 V.live = () => {
   const L = S.live;
   return { html: `<section class="screen has-nav">${top('Live Voice Changer')}
@@ -1221,13 +1232,29 @@ V.live = () => {
       <div class="slider"><span>Echo</span><input type="range" id="lv-echo" min="0" max="0.8" step="0.05" value="${L.echo}" aria-label="Echo"><b id="lv-echo-v">${Math.round(L.echo * 100)}%</b></div>
       <div class="slider"><span>Reverb</span><input type="range" id="lv-reverb" min="0" max="1" step="0.05" value="${L.reverb}" aria-label="Reverb"><b id="lv-reverb-v">${Math.round(L.reverb * 100)}%</b></div>
       <label class="check" style="margin:8px 0"><input type="checkbox" id="lv-monitor" ${L.monitor ? 'checked' : ''}><span>Hear myself <span class="muted">– turn off to record silently</span></span></label>
+      <label class="check" style="margin:8px 0"><input type="checkbox" id="lv-denoise" ${L.denoise ? 'checked' : ''}><span>Reduce background noise <span class="muted">– may clip quiet word endings</span></span></label>
     </details>
     <div class="grow"></div><button class="btn" id="live-rec" disabled>${icon('mic')} Record</button>${nav('live')}</section>`,
   bind: r => {
-    let ctx = null, stream = null, src = null, shifter = null, chainOut = null, outGain = null, analyser = null, recDest = null, rec = null, chunks = [], recT0 = 0, raf = 0, tick = 0;
+    let ctx = null, stream = null, src = null, shifter = null, chainOut = null, outGain = null, analyser = null, recDest = null, rec = null, chunks = [], recT0 = 0, raf = 0, tick = 0, finishing = null;
     const status = t => { $('#live-status', r).textContent = t; };
     const fx = () => ({ ...fxPreset(L.preset), echo: L.echo, reverb: L.reverb });
     const save = () => ls.set('live', L);
+    // Raw mic by default: the browser's noise suppression gates quiet word endings and echo cancellation ducks the voice.
+    const micConstraints = () => ({ echoCancellation: false, noiseSuppression: !!L.denoise, autoGainControl: false });
+    /** How long sound keeps coming out of the chain after the voice stops: pitch delay line + echo repeats + reverb tail. */
+    const tailMs = () => {
+      const echo = L.echo || 0, fb = Math.min(.75, echo * .9);
+      const echoMs = echo > 0 && fb > 0 ? Math.ceil(Math.log(.01 / echo) / Math.log(fb)) * 280 : 0;
+      return Math.min(2500, 350 + Math.max(0, echoMs) + (L.reverb > 0 ? 1500 : 0));
+    };
+    /** Stops the recording after the effect tail has played out, so the last word isn't cut. */
+    const finishRec = () => finishing || (finishing = new Promise(res => {
+      if (!rec || rec.state !== 'recording') { finishing = null; return res(); }
+      const btn = $('#live-rec', r); clearInterval(tick); btn.disabled = true; btn.innerHTML = 'Finishing…';
+      const done = rec.onstop; rec.onstop = async e => { finishing = null; await done?.(e); res(); };
+      setTimeout(() => { if (rec?.state === 'recording') rec.stop(); else { finishing = null; res(); } }, tailMs());
+    }));
     const rewire = () => {   // (re)build the effect chain after a preset or mix change
       if (!ctx) return;
       const head = shifter || src;
@@ -1237,14 +1264,14 @@ V.live = () => {
       if (shifter) shifter.parameters.get('ratio').value = 2 ** (L.pitch / 12);
     };
     const stop = () => {
-      cancelAnimationFrame(raf); clearInterval(tick);
+      cancelAnimationFrame(raf); clearInterval(tick); finishing = null;
       if (rec && rec.state !== 'inactive') rec.stop();
       stream?.getTracks().forEach(t => t.stop()); ctx?.close().catch(() => {});
       ctx = stream = src = shifter = chainOut = outGain = analyser = recDest = null;
       const b = $('#live-toggle', r); if (b) { b.classList.remove('on'); b.setAttribute('aria-pressed', 'false'); $('span', b).textContent = 'Start'; $('#live-rec', r).disabled = true; status('Microphone is off'); $('#lvl', r).style.width = '0'; }
     };
     const start = async () => {
-      try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } }); }
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() }); }
       catch { return toast('Microphone unavailable – allow access to use the live voice changer'); }
       ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
       src = ctx.createMediaStreamSource(stream);
@@ -1261,7 +1288,11 @@ V.live = () => {
       const b = $('#live-toggle', r); b.classList.add('on'); b.setAttribute('aria-pressed', 'true'); $('span', b).textContent = 'Stop'; $('#live-rec', r).disabled = false;
       status(`Live · ${fxPreset(L.preset).name}`);
     };
-    $('#live-toggle', r).onclick = () => ctx ? stop() : start();
+    $('#live-toggle', r).onclick = async () => {
+      if (!ctx) return start();
+      if (rec && rec.state === 'recording') { $('#live-toggle', r).disabled = true; await finishRec(); const t = $('#live-toggle', r); if (t) t.disabled = false; }
+      stop();
+    };
     $$('[data-live]', r).forEach(b => b.onclick = () => {
       const p = fxPreset(b.dataset.live); L.preset = p.id; L.pitch = p.pitch || 0; L.echo = p.echo || 0; L.reverb = p.reverb || 0; save();
       $$('[data-live]', r).forEach(x => x.classList.toggle('on', x === b));
@@ -1271,16 +1302,25 @@ V.live = () => {
     });
     [['pitch', v => `${v > 0 ? '+' : ''}${v} st`], ['echo', v => Math.round(v * 100) + '%'], ['reverb', v => Math.round(v * 100) + '%']].forEach(([k, show]) =>
       $('#lv-' + k, r).oninput = e => { L[k] = +e.target.value; $(`#lv-${k}-v`, r).textContent = show(L[k]); save(); if (k === 'pitch') { if (shifter) shifter.parameters.get('ratio').value = 2 ** (L.pitch / 12); } else rewire(); });
+    $('#lv-denoise', r).onchange = async e => {
+      L.denoise = e.target.checked; save();
+      const track = stream?.getAudioTracks()[0]; if (!track) return;
+      try { await track.applyConstraints(micConstraints()); }
+      catch {   // some browsers can't change processing on a live track – reopen the mic
+        if (rec && rec.state === 'recording') return toast('Takes effect after this recording');
+        stop(); start();
+      }
+    };
     $('#lv-monitor', r).onchange = e => { L.monitor = e.target.checked; save(); if (outGain) { try { outGain.disconnect(ctx.destination); } catch { /* wasn't connected */ } if (L.monitor) outGain.connect(ctx.destination); } };
     $('#live-rec', r).onclick = () => {
       const btn = $('#live-rec', r);
-      if (rec && rec.state === 'recording') { rec.stop(); return; }
+      if (rec && rec.state === 'recording') { finishRec(); return; }
       chunks = []; rec = new MediaRecorder(recDest.stream); rec.ondataavailable = e => e.data.size && chunks.push(e.data);
       rec.onstop = async () => {
-        clearInterval(tick); btn.innerHTML = `${icon('mic')} Record`; btn.classList.remove('rec-on');
+        clearInterval(tick); btn.innerHTML = `${icon('mic')} Record`; btn.classList.remove('rec-on'); btn.disabled = !ctx;
         if (!chunks.length) return;
         try {
-          const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' }), buf = await decode(blob);
+          const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' }), buf = trimTail(await decode(blob), .3);
           if (buf.duration < .5) return toast('Recording too short');
           const wav = encodeWav(mono(buf), buf.sampleRate), id = uid(), name = fxPreset(L.preset).name;
           await blobs.put('audio:' + id, wav);

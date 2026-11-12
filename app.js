@@ -50,20 +50,27 @@ const idb = (() => {
 })();
 
 /* ───────────── optional Supabase sync (active only when config.js has a key) ───────────── */
+/** Shown instead of the browser's bare "Failed to fetch" when the backend can't be reached at all. */
+const NET_MSG = 'Can’t reach the JoloVocals server right now – it may be paused or offline. Try again in a minute.';
+const isNetError = e => !!e && (e instanceof TypeError || e.name === 'AuthRetryableFetchError' || e.status === 0 || /failed to fetch|network ?error|load failed|networkerror/i.test(e.message || ''));
 const cloud = (() => {
-  const cfg = window.JV_CONFIG || {}, on = !!(window.supabase && cfg.SUPABASE_URL && cfg.SUPABASE_KEY);
+  const cfg = window.JV_CONFIG || {};
+  let on = !!(window.supabase && cfg.SUPABASE_URL && cfg.SUPABASE_KEY);
   const sb = on ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_KEY) : null;
   let uid_ = null;
   const safe = async fn => { try { const r = await fn(); if (r?.error) throw r.error; return r; } catch (e) { console.warn('[cloud]', e.message || e); return null; } };
   const path = f => `${uid_}/${f.replace(':', '-')}`;
   return {
     on, hosted: on && !!cfg.HOSTED_VOICES,
+    /** Switches this tab to local-only mode (used while the server is unreachable). */
+    goOffline() { on = false; this.on = false; this.hosted = false; },
     /** POST to the voice-api Edge Function (ElevenLabs proxy). `body` is a JSON string or FormData. */
     async fn(path, body) {
       const { data } = await sb.auth.getSession(), token = data.session?.access_token;
       if (!token) throw new Error('sign in required');
       const r = await fetch(`${cfg.SUPABASE_URL}/functions/v1/voice-api/${path}`, { method: 'POST', body,
-        headers: { authorization: `Bearer ${token}`, apikey: cfg.SUPABASE_KEY, ...(typeof body === 'string' ? { 'content-type': 'application/json' } : {}) } });
+        headers: { authorization: `Bearer ${token}`, apikey: cfg.SUPABASE_KEY, ...(typeof body === 'string' ? { 'content-type': 'application/json' } : {}) } })
+        .catch(e => { throw isNetError(e) ? new Error(NET_MSG) : e; });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `request failed (${r.status})`);
       return r;
     },
@@ -94,7 +101,7 @@ const cloud = (() => {
           let msg = `request failed (${x.status})`; try { msg = JSON.parse(await x.response.text()).error || msg; } catch { /* keep default */ }
           reject(new Error(msg));
         };
-        x.onerror = () => reject(new Error('network error')); x.onabort = () => reject(new Error('cancelled'));
+        x.onerror = () => reject(new Error(NET_MSG)); x.onabort = () => reject(new Error('cancelled'));
         x.send(body); if (typeof body === 'string') markSent();
       });
     },
@@ -887,6 +894,11 @@ V.splash = () => ({
   bind: r => { $('#start', r).onclick = () => go(S.user ? 'home' : 'login'); },
 });
 
+/** Local-only account (demo mode or offline mode): just a name kept in this browser. */
+function localSignIn(id) {
+  const nm = id.includes('@') ? id.split('@')[0] : id || 'Friend';
+  S.user = { id, name: nm.charAt(0).toUpperCase() + nm.slice(1) }; ls.set('user', S.user); go('home');
+}
 V.login = () => {
   let mode = 'in';
   return { html: `<section class="screen auth"><div class="center" style="margin:6px 0 18px"><div class="brand" style="font-size:34px">Jolo<b>Vocals</b></div><div class="muted">AI Voice Studio</div></div>
@@ -897,6 +909,8 @@ V.login = () => {
     <form id="f"><label class="lbl" style="margin-top:0">Email or phone number</label><input class="field" id="id" placeholder="Enter your email or phone" autocomplete="username" required>
     <label class="lbl">Password</label><input class="field" id="pw" type="password" placeholder="Enter your password" autocomplete="current-password" required minlength="4">
     <div class="gap"></div><button class="btn" id="go">Sign In</button></form>
+    <div id="net-down" class="net-down" hidden><p>⚠️ ${NET_MSG}</p><button type="button" class="btn outline" id="offline">Continue offline</button>
+      <small class="muted">Your voices and history stay on this device until the server is back.</small></div>
     <p class="muted center" style="margin-top:14px">${cloud.on ? 'Your voices sync to your account.' : 'Demo mode: accounts are stored only in this browser.'}</p></section>`,
   bind: r => {
     $$('[data-demo]', r).forEach(b => b.onclick = () => toast('Social sign-in needs a backend – use email/phone for the demo'));
@@ -909,11 +923,18 @@ V.login = () => {
           const d = await cloud.auth(mode, id, pw);
           if (!d.session) { btn.disabled = false; return toast('Check your email to confirm your account, then sign in'); }
           await startSession(d.session.user); go('home');
-        } catch (err) { btn.disabled = false; toast(err.message || 'Sign-in failed'); }
+        } catch (err) {
+          btn.disabled = false;
+          if (isNetError(err)) { $('#net-down', r).hidden = false; return $('#net-down', r).scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
+          toast(err.message || 'Sign-in failed');
+        }
         return;
       }
-      const nm = id.includes('@') ? id.split('@')[0] : 'Friend';
-      S.user = { id, name: nm.charAt(0).toUpperCase() + nm.slice(1) }; ls.set('user', S.user); go('home'); };
+      localSignIn(id); };
+    $('#offline', r).onclick = () => {
+      cloud.goOffline(); try { sessionStorage.setItem('jv.offline', '1'); } catch { /* private mode */ }
+      localSignIn($('#id', r).value.trim() || 'Friend'); toast('Offline mode – everything stays on this device');
+    };
   } };
 };
 
@@ -1486,6 +1507,7 @@ window.addEventListener('resize', () => { const bar = $('#app > nav.bottom'); if
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(e => console.warn('[sw]', e));
 speechSynthesis?.getVoices();
 (async () => {
+  try { if (sessionStorage.getItem('jv.offline')) cloud.goOffline(); } catch { /* private mode */ }
   if (cloud.on) {
     const u = await cloud.session().catch(() => null);
     if (u) await startSession(u); else if (S.user) { S.user = null; ls.set('user', null); }
